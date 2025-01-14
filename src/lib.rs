@@ -9,17 +9,20 @@ use rusb::constants::{
     LIBUSB_TRANSFER_TYPE_CONTROL, LIBUSB_TRANSFER_TYPE_INTERRUPT, LIBUSB_TRANSFER_TYPE_ISOCHRONOUS,
 };
 use rusb::ffi::{
-    libusb_alloc_transfer, libusb_fill_control_transfer, libusb_fill_interrupt_transfer,
-    libusb_free_transfer, libusb_submit_transfer, libusb_transfer,
+    libusb_alloc_transfer, libusb_cancel_transfer, libusb_fill_control_transfer,
+    libusb_fill_interrupt_transfer, libusb_free_transfer, libusb_submit_transfer, libusb_transfer,
 };
 use std::time::Duration;
 use std::{ffi::c_void, marker::PhantomData, ptr::NonNull};
-use tokio::sync::oneshot;
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use zerocopy_derive::*;
 
 mod dma;
+
+type Notifier = mpsc::Sender<()>;
+type Receiver = mpsc::Receiver<()>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, IntoBytes, FromBytes, Immutable, KnownLayout)]
 #[repr(C)]
@@ -61,8 +64,8 @@ impl TransferStatus {
 
 #[derive(Debug)]
 pub struct Transfer<C: rusb::UsbContext> {
-    inner: Option<NonNull<libusb_transfer>>,
-    notifier: oneshot::Receiver<NonNull<libusb_transfer>>,
+    inner: NonNull<libusb_transfer>,
+    notifier: Receiver,
     buf: BytesMut,
     _ctx: PhantomData<C>,
 }
@@ -84,23 +87,24 @@ impl<C: rusb::UsbContext> Transfer<C> {
     /// # Safety
     ///
     /// The caller must ensure that the capacity of `buf` is exactly
-    /// the size of the buffer they want passed to the USB device.
+    /// the size of the buffer they want passed to the USB device,
+    /// and that:
+    ///
+    /// - `buf.len() != 0`
+    /// - `buf.capacity() != 0`
     ///
     /// Regardless if `buf` contains initialized data, its length will be set to 0
     /// so that the entire slice can be passed to `libusb_fill_interrupt_transfer`
     /// as a `*mut MaybeUninit<u8>`.
-    pub unsafe fn fill_int(
+    pub unsafe fn new_int(
         dev_handle: &rusb::DeviceHandle<C>,
         endpoint: u8,
         mut buf: BytesMut,
     ) -> Self {
-        debug_assert_eq!(
-            size_of::<Box<oneshot::Sender<NonNull<libusb_transfer>>>>(),
-            size_of::<*mut c_void>()
-        );
+        debug_assert_eq!(size_of::<Box<Notifier>>(), size_of::<*mut c_void>());
         let transfer = Self::alloc_raw(0);
-        let (tx, rx) = oneshot::channel();
-        let user_data = Box::into_raw(Box::new(tx));
+        let (tx, rx) = mpsc::channel(1);
+        let user_data: *mut Notifier = Box::into_raw(Box::new(tx));
 
         // SAFETY: Caller ensures that the capacity of `buf`
         //         is exactly the size of the buffer they want
@@ -122,7 +126,7 @@ impl<C: rusb::UsbContext> Transfer<C> {
         };
 
         Self {
-            inner: Some(transfer),
+            inner: transfer,
             notifier: rx,
             buf,
             _ctx: PhantomData,
@@ -138,30 +142,26 @@ impl<C: rusb::UsbContext> Transfer<C> {
     ///
     /// # Safety
     ///
-    /// The caller must ensure that the capacity of `buf` is exactly
-    /// the size of the buffer they want passed to the USB device.
+    /// The caller must ensure that:
+    ///
+    /// - `buf.len() > 8`
+    /// - `ControlPacket::w_length + std::mem::size_of::<ControlPacket>() == buf.capacity()`
     ///
     /// ALSO, the caller must make sure that the first 8 bytes of `buf`
-    /// contain the [`ControlPacket`], and that:
-    /// ```
-    /// ControlPacket::w_length + size_of::<ControlPacket>() == buf.capacity()
-    /// ```
+    /// contain the [`ControlPacket`].
     ///
-    /// Regardless if `buf` contains initialized data, its length will be set to 0
-    /// so that the entire slice can be passed to `libusb_fill_interrupt_transfer`
-    /// as a `*mut MaybeUninit<u8>`.
-    pub unsafe fn fill_ctrl(
+    /// Regardless how much of `buf` contains initialized data, its length will
+    /// be set to 0 so that the entire slice can be passed to
+    /// `libusb_fill_interrupt_transfer` as a `*mut MaybeUninit<u8>`.
+    pub unsafe fn new_ctrl(
         dev_handle: &rusb::DeviceHandle<C>,
         mut buf: BytesMut,
         timeout: Duration,
     ) -> Self {
-        debug_assert_eq!(
-            size_of::<Box<oneshot::Sender<NonNull<libusb_transfer>>>>(),
-            size_of::<*mut c_void>()
-        );
+        debug_assert_eq!(size_of::<Box<Notifier>>(), size_of::<*mut c_void>());
         let transfer = Self::alloc_raw(0);
-        let (tx, rx) = oneshot::channel();
-        let user_data = Box::into_raw(Box::new(tx));
+        let (tx, rx) = mpsc::channel(1);
+        let user_data: *mut Notifier = Box::into_raw(Box::new(tx));
         let timeout = timeout.clamp(Duration::ZERO, Duration::from_millis(u32::MAX as u64));
 
         // SAFETY: Caller ensures that the capacity of `buf`
@@ -182,38 +182,68 @@ impl<C: rusb::UsbContext> Transfer<C> {
         };
 
         Self {
-            inner: Some(transfer),
+            inner: transfer,
             notifier: rx,
             buf,
             _ctx: PhantomData,
         }
     }
 
+    /// Submits this transfer to libusb.
+    ///
+    /// # Errors
+    ///
+    /// If this function encounters any error while fulfilling the transfer
+    /// request, an error variant will be returned. If this function returns an
+    /// error, no data was transferred.
+    ///
+    /// The errors returned by this function include:
+    ///
+    /// - `NoDevice` if the device has been disconnected
+    /// - `InvalidParam` if the transfer size is larger than the operating
+    ///   system and/or hardware can support
+    /// - `Busy` if this is a resubmit and the buffer hadn't been reset
+    /// - `Error` on general failure
+    ///
+    /// # Cancel safety
+    ///
+    /// If `submit` is used as an event in [`tokio::select`] and some other branch
+    /// completes first, then future calls to `submit` will continue waiting for the
+    /// transfer to complete.
+    ///
+    /// If [`Transfer`] is dropped after cancelling the future,
+    /// it will send a cancellation request to libusb and block until the transfer
+    /// completes, then deallocates the transfer to prevent leaking memory/undefined behavior.
     pub async fn submit(
         &mut self,
         cancel_token: CancellationToken,
     ) -> Result<TransferStatus, rusb::Error> {
+        if !self.buf.is_empty() {
+            return Err(rusb::Error::Busy);
+        }
+
         // SAFETY: We hold exclusive mutable access to `self`.
         //         Therefore, we can prevent anyone else from
         //         accessing the BytesMut and the inner transfer
         //         while libusb uses the data.
-        let result = unsafe { libusb_submit_transfer(self.inner.take().unwrap().as_ptr()) };
-        if 0 != result {
-            return Err(from_libusb(result));
+        match unsafe { self.inner_submit() } {
+            Ok(_) | Err(rusb::Error::Busy) => (),
+            Err(err) => return Err(err),
         }
 
         enum Event {
             Cancelled,
-            Completed(NonNull<libusb_transfer>),
+            Completed,
         }
 
-        let transfer = match tokio::select! {
+        if let Event::Cancelled = tokio::select! {
             biased;
             _ = cancel_token.cancelled() => Event::Cancelled,
-            transfer = &mut self.notifier => Event::Completed(transfer.unwrap()),
+            _ = self.notifier.recv() => Event::Completed,
         } {
-            Event::Cancelled => (&mut self.notifier).await.unwrap(),
-            Event::Completed(transfer) => transfer,
+            if self.cancel().is_ok() {
+                self.notifier.recv().await.unwrap();
+            }
         };
 
         // SAFETY: libusb has completed the transfer and is no
@@ -223,20 +253,60 @@ impl<C: rusb::UsbContext> Transfer<C> {
         //         pointer, making it safe to access.
         unsafe {
             // Update BytesMut with the new buffer length from transfer
-            let transfer_ref = transfer.as_ref();
+            let transfer_ref = self.inner.as_ref();
             let mut transfer_len = transfer_ref.actual_length as usize;
             if LIBUSB_TRANSFER_TYPE_CONTROL == transfer_ref.transfer_type {
                 transfer_len += size_of::<ControlPacket>();
             }
-            self.buf.set_len(self.buf.len() + transfer_len);
+            self.buf.set_len(transfer_len);
 
             // Get status from transfer
             let status = TransferStatus::from_i32(transfer_ref.status).unwrap();
 
-            // Put transfer back into self
-            self.inner = Some(transfer);
-
             Ok(status)
+        }
+    }
+
+    /// # Safety
+    ///
+    /// Caller must make sure that the transfer's buffer contains
+    /// the right data for the transfer type.
+    unsafe fn inner_submit(&mut self) -> Result<(), rusb::Error> {
+        // SAFETY: `self.inner` is a valid pointer for the entirety
+        //         of self's lifetime. Also, caller ensures that
+        //         the transfer buffer points to the right data for
+        //         this transfer type.
+        let result = unsafe { libusb_submit_transfer(self.inner.as_ptr()) };
+        if 0 != result {
+            Err(from_libusb(result))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn cancel(&mut self) -> Result<(), rusb::Error> {
+        // SAFETY: `self.inner` is a valid pointer
+        //         for the entirety of self's lifetime.
+        let result = unsafe { libusb_cancel_transfer(self.inner.as_ptr()) };
+        if 0 != result {
+            Err(from_libusb(result))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Attempts to reset the buffer for using in a transfer.
+    /// Returns `rusb::Error::Busy` if called while a transfer
+    /// is active.
+    ///
+    /// On success, a call to [`Transfer::buf()`] or
+    /// [`Transfer::buf_mut()`] returns `None`.
+    pub fn reset_buf(&mut self) -> Result<(), rusb::Error> {
+        if self.buf.is_empty() {
+            Err(rusb::Error::Busy)
+        } else {
+            unsafe { self.buf.set_len(0) };
+            Ok(())
         }
     }
 
@@ -244,70 +314,78 @@ impl<C: rusb::UsbContext> Transfer<C> {
     /// of `Duration::ZERO` indicates no timeout.
     pub const fn timeout(&self) -> Duration {
         // SAFETY: `self.inner` is a valid and initialized
-        //         pointer to a `libusb_transfer`
-        unsafe {
-            match self.inner {
-                Some(inner) => Duration::from_millis(inner.as_ref().timeout as u64),
-                None => unreachable!(),
-            }
-        }
+        //         pointer to a `libusb_transfer`.
+        unsafe { Duration::from_millis(self.inner.as_ref().timeout as u64) }
     }
 
     /// Returns the transfer's `rusb::TransferType`.
     pub const fn kind(&self) -> rusb::TransferType {
         unsafe {
-            match self.inner {
-                Some(inner) => match inner.as_ref().transfer_type {
-                    LIBUSB_TRANSFER_TYPE_CONTROL => rusb::TransferType::Control,
-                    LIBUSB_TRANSFER_TYPE_INTERRUPT => rusb::TransferType::Interrupt,
-                    LIBUSB_TRANSFER_TYPE_BULK => rusb::TransferType::Bulk,
-                    LIBUSB_TRANSFER_TYPE_ISOCHRONOUS => rusb::TransferType::Isochronous,
-                    _ => unreachable!(),
-                },
-                None => unreachable!(),
+            match self.inner.as_ref().transfer_type {
+                LIBUSB_TRANSFER_TYPE_CONTROL => rusb::TransferType::Control,
+                LIBUSB_TRANSFER_TYPE_INTERRUPT => rusb::TransferType::Interrupt,
+                LIBUSB_TRANSFER_TYPE_BULK => rusb::TransferType::Bulk,
+                LIBUSB_TRANSFER_TYPE_ISOCHRONOUS => rusb::TransferType::Isochronous,
+                _ => unreachable!(),
             }
         }
     }
 
     /// Returns a slice containing the transfer's initialized buffer.
     /// During a call to [`Transfer::submit`], this function returns
-    /// an empty slice.
-    pub fn buffer(&self) -> &[u8] {
-        match self.inner {
-            Some(_) => &self.buf,
-            None => &[]
+    /// `None`.
+    pub fn buf(&self) -> Option<&[u8]> {
+        if self.buf.is_empty() {
+            None
+        } else {
+            Some(&self.buf)
+        }
+    }
+
+    /// Returns a mutable slice containing the transfer's initialized
+    /// buffer. During a call to [`Transfer::submit`], this function returns
+    /// `None`.
+    pub fn buf_mut(&mut self) -> Option<&mut [u8]> {
+        if self.buf.is_empty() {
+            None
+        } else {
+            Some(&mut self.buf)
         }
     }
 }
 
 impl<T: rusb::UsbContext> Drop for Transfer<T> {
     fn drop(&mut self) {
-        match self.inner {
-            // SAFETY: libusb allocated this buffer,
-            //         so they get to free it.
-            Some(ptr) => unsafe {
-                libusb_free_transfer(ptr.as_ptr());
-            },
-            // It's unlikely, but still possible for now that
-            // `Transfer::submit` might panic, so we do nothing
-            // here to prevent double panic.
-            None => (),
+        if self.cancel().is_ok() {
+            self.notifier.blocking_recv();
+        }
+
+        // SAFETY: libusb allocated this buffer,
+        //         so they get to free it.
+        //         Also, `user_data` will never be null
+        //         due to the Transfer::new_* functions.
+        unsafe {
+            let user_data: *mut Notifier = self.inner.as_ref().user_data.cast();
+            _ = Box::from_raw(user_data);
+            self.inner.as_mut().user_data = std::ptr::null_mut();
+            self.inner.as_mut().buffer = std::ptr::null_mut();
+            libusb_free_transfer(self.inner.as_ptr());
         }
     }
 }
 
+/// Handles a USB transfer completion, cancellation, error, or whatever,
+/// by simply alerting the function that submitted the transfer.
 extern "system" fn transfer_callback(transfer: *mut libusb_transfer) {
     // SAFETY: `transfer` is a valid pointer and can be used to access
-    //         `user_data`. `user_data` is a valid
-    //         `Box<oneshot::Sender<NonNull<libusb_transfer>>>` pointer
+    //         `user_data`. `user_data` is a valid `Box<Notifier>` pointer
     //         created from `Box::into_raw`, and can be turned back into
     //         a box.
     let notifier = unsafe {
-        let user_data: *mut oneshot::Sender<NonNull<libusb_transfer>> =
-            (*transfer).user_data.cast();
+        let user_data: *mut Notifier = (*transfer).user_data.cast();
         Box::from_raw(user_data)
     };
-    _ = notifier.send(NonNull::new(transfer).unwrap());
+    _ = notifier.send(());
 }
 
 pub(crate) fn from_libusb(err: i32) -> rusb::Error {
@@ -330,7 +408,6 @@ pub(crate) fn from_libusb(err: i32) -> rusb::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
 
     #[test]
     fn it_works() {}
