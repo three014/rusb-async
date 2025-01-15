@@ -10,3 +10,6 @@ tokio = { version = "1.43.0", default-features = false, features = ["sync", "mac
 tokio-util = { version = "0.7.13", default-features = false }
 zerocopy = "0.8.14"
 zerocopy-derive = "0.8.14"
+
+[dev-dependencies]
+tokio = { version = "1.43.0", default-features = false, features = ["rt-multi-thread"] }

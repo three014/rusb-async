@@ -349,8 +349,8 @@ impl<C: rusb::UsbContext> Transfer<C> {
 
         if let Event::Cancelled = tokio::select! {
             biased;
-            _ = cancel_token.cancelled() => Event::Cancelled,
             _ = self.notifier.recv() => Event::Completed,
+            _ = cancel_token.cancelled() => Event::Cancelled,
         } {
             if self.cancel().is_ok() {
                 self.notifier.recv().await.unwrap();
@@ -513,7 +513,7 @@ extern "system" fn transfer_callback(transfer: *mut libusb_transfer) {
         user_data.as_ref().unwrap()
     };
 
-    _ = notifier.0.send(());
+    _ = notifier.0.blocking_send(());
     *notifier.1.lock().unwrap() = State::Ready;
 }
 
