@@ -12,6 +12,7 @@ use rusb::ffi::{
     libusb_alloc_transfer, libusb_cancel_transfer, libusb_fill_control_transfer,
     libusb_fill_interrupt_transfer, libusb_free_transfer, libusb_submit_transfer, libusb_transfer,
 };
+use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 use std::{ffi::c_void, marker::PhantomData, ptr::NonNull};
 use tokio::sync::mpsc;
@@ -21,8 +22,16 @@ use zerocopy_derive::*;
 
 mod dma;
 
-type Notifier = mpsc::Sender<()>;
+type Notifier = (mpsc::Sender<()>, Mutex<State>);
 type Receiver = mpsc::Receiver<()>;
+
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum State {
+    #[default]
+    Idle,
+    Running,
+    Ready,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, IntoBytes, FromBytes, Immutable, KnownLayout)]
 #[repr(C)]
@@ -87,11 +96,7 @@ impl<C: rusb::UsbContext> Transfer<C> {
     /// # Safety
     ///
     /// The caller must ensure that the capacity of `buf` is exactly
-    /// the size of the buffer they want passed to the USB device,
-    /// and that:
-    ///
-    /// - `buf.len() != 0`
-    /// - `buf.capacity() != 0`
+    /// the size of the buffer they want passed to the USB device.
     ///
     /// Regardless if `buf` contains initialized data, its length will be set to 0
     /// so that the entire slice can be passed to `libusb_fill_interrupt_transfer`
@@ -104,7 +109,7 @@ impl<C: rusb::UsbContext> Transfer<C> {
         debug_assert_eq!(size_of::<Box<Notifier>>(), size_of::<*mut c_void>());
         let transfer = Self::alloc_raw(0);
         let (tx, rx) = mpsc::channel(1);
-        let user_data: *mut Notifier = Box::into_raw(Box::new(tx));
+        let user_data: *mut Notifier = Box::into_raw(Box::new((tx, Mutex::default())));
 
         // SAFETY: Caller ensures that the capacity of `buf`
         //         is exactly the size of the buffer they want
@@ -144,7 +149,7 @@ impl<C: rusb::UsbContext> Transfer<C> {
     ///
     /// The caller must ensure that:
     ///
-    /// - `buf.len() > 8`
+    /// - `buf.len() >= 8`
     /// - `ControlPacket::w_length + std::mem::size_of::<ControlPacket>() == buf.capacity()`
     ///
     /// ALSO, the caller must make sure that the first 8 bytes of `buf`
@@ -161,7 +166,7 @@ impl<C: rusb::UsbContext> Transfer<C> {
         debug_assert_eq!(size_of::<Box<Notifier>>(), size_of::<*mut c_void>());
         let transfer = Self::alloc_raw(0);
         let (tx, rx) = mpsc::channel(1);
-        let user_data: *mut Notifier = Box::into_raw(Box::new(tx));
+        let user_data: *mut Notifier = Box::into_raw(Box::new((tx, Mutex::default())));
         let timeout = timeout.clamp(Duration::ZERO, Duration::from_millis(u32::MAX as u64));
 
         // SAFETY: Caller ensures that the capacity of `buf`
@@ -186,6 +191,38 @@ impl<C: rusb::UsbContext> Transfer<C> {
             notifier: rx,
             buf,
             _ctx: PhantomData,
+        }
+    }
+
+    fn state(&self) -> State {
+        // SAFETY: Both pointers are always valid
+        //         and no one takes a mutable reference
+        //         to them.
+        unsafe {
+            *self
+                .inner
+                .as_ref()
+                .user_data
+                .cast::<Notifier>()
+                .as_ref()
+                .unwrap()
+                .1
+                .lock()
+                .unwrap()
+        }
+    }
+
+    fn state_mut(&mut self) -> MutexGuard<'_, State> {
+        unsafe {
+            self.inner
+                .as_ref()
+                .user_data
+                .cast::<Notifier>()
+                .as_ref()
+                .unwrap()
+                .1
+                .lock()
+                .unwrap()
         }
     }
 
@@ -218,8 +255,10 @@ impl<C: rusb::UsbContext> Transfer<C> {
         &mut self,
         cancel_token: CancellationToken,
     ) -> Result<TransferStatus, rusb::Error> {
-        if !self.buf.is_empty() {
-            return Err(rusb::Error::Busy);
+        if State::Ready == self.state() {
+            // SAFETY: Transfer is ready, therefore libusb is no longer mutating `status`
+            let status = TransferStatus::from_i32(unsafe { self.inner.as_ref().status }).unwrap();
+            return Ok(status);
         }
 
         // SAFETY: We hold exclusive mutable access to `self`.
@@ -227,7 +266,13 @@ impl<C: rusb::UsbContext> Transfer<C> {
         //         accessing the BytesMut and the inner transfer
         //         while libusb uses the data.
         match unsafe { self.inner_submit() } {
-            Ok(_) | Err(rusb::Error::Busy) => (),
+            Ok(_) => {
+                let mut state = self.state_mut();
+                if State::Ready != *state {
+                    *state = State::Running;
+                }
+            }
+            Err(rusb::Error::Busy) => (),
             Err(err) => return Err(err),
         }
 
@@ -302,10 +347,11 @@ impl<C: rusb::UsbContext> Transfer<C> {
     /// On success, a call to [`Transfer::buf()`] or
     /// [`Transfer::buf_mut()`] returns `None`.
     pub fn reset_buf(&mut self) -> Result<(), rusb::Error> {
-        if self.buf.is_empty() {
+        if State::Running == self.state() {
             Err(rusb::Error::Busy)
         } else {
             unsafe { self.buf.set_len(0) };
+            *self.state_mut() = State::Idle;
             Ok(())
         }
     }
@@ -335,7 +381,7 @@ impl<C: rusb::UsbContext> Transfer<C> {
     /// During a call to [`Transfer::submit`], this function returns
     /// `None`.
     pub fn buf(&self) -> Option<&[u8]> {
-        if self.buf.is_empty() {
+        if State::Ready != self.state() {
             None
         } else {
             Some(&self.buf)
@@ -346,18 +392,33 @@ impl<C: rusb::UsbContext> Transfer<C> {
     /// buffer. During a call to [`Transfer::submit`], this function returns
     /// `None`.
     pub fn buf_mut(&mut self) -> Option<&mut [u8]> {
-        if self.buf.is_empty() {
+        if State::Ready != self.state() {
             None
         } else {
             Some(&mut self.buf)
+        }
+    }
+
+    pub fn into_buf(mut self) -> Option<BytesMut> {
+        if State::Ready != self.state() {
+            None
+        } else {
+            // Transfer is ready, therefore we can replace
+            // self.buf with an empty BytesMut.
+            let buf = std::mem::replace(&mut self.buf, BytesMut::new());
+            Some(buf)
         }
     }
 }
 
 impl<T: rusb::UsbContext> Drop for Transfer<T> {
     fn drop(&mut self) {
-        if self.cancel().is_ok() {
-            self.notifier.blocking_recv();
+        match self.state() {
+            State::Running => {
+                _ = self.cancel();
+                _ = self.notifier.blocking_recv();
+            }
+            State::Idle | State::Ready => (),
         }
 
         // SAFETY: libusb allocated this buffer,
@@ -382,10 +443,12 @@ extern "system" fn transfer_callback(transfer: *mut libusb_transfer) {
     //         created from `Box::into_raw`, and can be turned back into
     //         a box.
     let notifier = unsafe {
-        let user_data: *mut Notifier = (*transfer).user_data.cast();
-        Box::from_raw(user_data)
+        let user_data: *const Notifier = transfer.as_ref().unwrap().user_data.cast();
+        user_data.as_ref().unwrap()
     };
-    _ = notifier.send(());
+
+    _ = notifier.0.send(());
+    *notifier.1.lock().unwrap() = State::Ready;
 }
 
 pub(crate) fn from_libusb(err: i32) -> rusb::Error {
