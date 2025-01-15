@@ -25,6 +25,70 @@ mod dma;
 type Notifier = (mpsc::Sender<()>, Mutex<State>);
 type Receiver = mpsc::Receiver<()>;
 
+pub struct Ptr<T: ?Sized> {
+    pointer: NonNull<T>,
+    _p: PhantomData<T>,
+}
+
+unsafe impl<T: Send + ?Sized> Send for Ptr<T> {}
+unsafe impl<T: Sync + ?Sized> Sync for Ptr<T> {}
+
+impl<T: ?Sized> Ptr<T> {
+    pub fn new(ptr: *mut T) -> Option<Self> {
+        if let Some(pointer) = NonNull::new(ptr) {
+            Some(Ptr {
+                pointer,
+                _p: PhantomData,
+            })
+        } else {
+            None
+        }
+    }
+
+    pub const fn as_ptr(self) -> *mut T {
+        self.pointer.as_ptr()
+    }
+
+    pub const fn as_non_null_ptr(self) -> NonNull<T> {
+        self.pointer
+    }
+
+    pub const unsafe fn as_ref(&self) -> &T {
+        unsafe { self.pointer.as_ref() }
+    }
+
+    pub const unsafe fn as_mut(&mut self) -> &mut T {
+        unsafe { self.pointer.as_mut() }
+    }
+
+    pub const fn cast<U>(self) -> Ptr<U> {
+        Ptr {
+            pointer: self.pointer.cast(),
+            _p: PhantomData,
+        }
+    }
+}
+
+impl<T: ?Sized> Clone for Ptr<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T: ?Sized> Copy for Ptr<T> {}
+
+impl<T: ?Sized> std::fmt::Debug for Ptr<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.pointer.fmt(f)
+    }
+}
+
+impl<T: ?Sized> std::fmt::Pointer for Ptr<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.pointer.fmt(f)
+    }
+}
+
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
     #[default]
@@ -73,21 +137,23 @@ impl TransferStatus {
 
 #[derive(Debug)]
 pub struct Transfer<C: rusb::UsbContext> {
-    inner: NonNull<libusb_transfer>,
+    inner: Ptr<libusb_transfer>,
     notifier: Receiver,
     buf: BytesMut,
     _ctx: PhantomData<C>,
 }
 
+unsafe impl<C: rusb::UsbContext> Send for Transfer<C> {}
+
 impl<C: rusb::UsbContext> Transfer<C> {
-    pub(crate) fn alloc_raw(num_isos: usize) -> NonNull<libusb_transfer> {
+    pub(crate) fn alloc_raw(num_isos: usize) -> Ptr<libusb_transfer> {
         assert!(u16::MAX as usize > num_isos);
 
         // SAFETY: libusb allocates the data, and returns a null ptr
         //         if the allocation somehow failed.
         let ptr = unsafe { libusb_alloc_transfer(num_isos as i32) };
 
-        NonNull::new(ptr).unwrap()
+        Ptr::new(ptr).unwrap()
     }
 
     /// Allocates a [`libusb_transfer`] using FFI, then populates
@@ -471,7 +537,17 @@ pub(crate) fn from_libusb(err: i32) -> rusb::Error {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
 
     #[test]
-    fn it_works() {}
+    fn transfer_is_send() {
+        fn send_thing<T: Send>(_item: T) {}
+
+        let handle = rusb::open_device_with_vid_pid(0x0000, 0x0000).unwrap();
+        let transfer = unsafe {
+            Transfer::new_ctrl(&handle, BytesMut::with_capacity(64), Duration::from_secs(5))
+        };
+
+        send_thing(transfer);
+    }
 }
