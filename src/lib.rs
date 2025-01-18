@@ -9,7 +9,9 @@ use rusb::constants::{
     LIBUSB_TRANSFER_TYPE_CONTROL, LIBUSB_TRANSFER_TYPE_INTERRUPT, LIBUSB_TRANSFER_TYPE_ISOCHRONOUS,
 };
 use rusb::ffi::{
-    libusb_alloc_transfer, libusb_cancel_transfer, libusb_fill_bulk_transfer, libusb_fill_control_transfer, libusb_fill_interrupt_transfer, libusb_free_transfer, libusb_iso_packet_descriptor, libusb_submit_transfer, libusb_transfer
+    libusb_alloc_transfer, libusb_cancel_transfer, libusb_fill_bulk_transfer,
+    libusb_fill_control_transfer, libusb_fill_interrupt_transfer, libusb_free_transfer,
+    libusb_iso_packet_descriptor, libusb_submit_transfer, libusb_transfer,
 };
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
@@ -159,7 +161,11 @@ impl InnerTransfer {
         }
     }
 
-    pub(crate) fn clear(&mut self) {
+    /// # Safety
+    ///
+    /// Caller must not call this function if `self`
+    /// is owned by a `Transfer`.
+    pub(crate) unsafe fn clear(&mut self) {
         let transfer = unsafe { self.as_mut() };
         transfer.dev_handle = std::ptr::null_mut();
         transfer.flags = 0;
@@ -171,7 +177,10 @@ impl InnerTransfer {
         transfer.num_iso_packets = 0;
         transfer.callback = dummy_callback;
         transfer.buffer = std::ptr::null_mut();
-        transfer.user_data = std::ptr::null_mut();
+        if !transfer.user_data.is_null() {
+            let _: Box<Notifier> = Box::from_raw(transfer.user_data.cast());
+            transfer.user_data = std::ptr::null_mut();
+        }
     }
 
     pub(crate) const fn as_raw(&self) -> *mut libusb_transfer {
@@ -331,16 +340,18 @@ impl InnerTransfer {
 
 impl Drop for InnerTransfer {
     fn drop(&mut self) {
-        unsafe {
-            let user_data: *mut Notifier = self.as_ref().user_data.cast();
-            if !user_data.is_null() {
-                _ = Box::from_raw(user_data);
-                self.as_mut().user_data = std::ptr::null_mut();
-            }
-            self.as_mut().buffer = std::ptr::null_mut();
-        }
-
+        // The only time the transfer needs to call its drop
+        // impl is when it's not owned by any other struct.
         if self.needs_drop {
+            unsafe {
+                let user_data: *mut Notifier = self.as_ref().user_data.cast();
+                if !user_data.is_null() {
+                    _ = Box::from_raw(user_data);
+                    self.as_mut().user_data = std::ptr::null_mut();
+                }
+                self.as_mut().buffer = std::ptr::null_mut();
+            }
+
             // SAFETY: libusb allocated this buffer,
             //         so they get to free it.
             unsafe {
@@ -519,22 +530,6 @@ impl<C: rusb::UsbContext> Transfer<C> {
         }
     }
 
-    // /// Attempts to reset the buffer for using in a transfer.
-    // /// Returns `rusb::Error::Busy` if called while a transfer
-    // /// is active.
-    // ///
-    // /// On success, a call to [`Transfer::buf()`] or
-    // /// [`Transfer::buf_mut()`] returns `None`.
-    // pub fn reset_buf(&mut self) -> Result<(), rusb::Error> {
-    //     if State::Running == self.state() {
-    //         Err(rusb::Error::Busy)
-    //     } else {
-    //         self.buf.clear();
-    //         *self.state_mut() = State::Idle;
-    //         Ok(())
-    //     }
-    // }
-
     /// Returns the transfer's timeout. A value
     /// of `Duration::ZERO` indicates no timeout.
     pub const fn timeout(&self) -> Duration {
@@ -560,7 +555,7 @@ impl<C: rusb::UsbContext> Transfer<C> {
     /// During a call to [`Transfer::submit`], this function returns
     /// `None`.
     pub fn buf(&self) -> Option<&[u8]> {
-        if State::Ready != self.state() {
+        if State::Running == self.state() {
             None
         } else {
             Some(&self.buf)
@@ -571,7 +566,7 @@ impl<C: rusb::UsbContext> Transfer<C> {
     /// buffer. During a call to [`Transfer::submit`], this function returns
     /// `None`.
     pub fn buf_mut(&mut self) -> Option<&mut [u8]> {
-        if State::Ready != self.state() {
+        if State::Running == self.state() {
             None
         } else {
             Some(&mut self.buf)
@@ -581,7 +576,7 @@ impl<C: rusb::UsbContext> Transfer<C> {
     /// Returns `None` if the transfer type is not isochronous or if
     /// the transfer is not ready.
     pub fn iso_packets(&self) -> Option<&[libusb_iso_packet_descriptor]> {
-        if State::Ready != self.state() || rusb::TransferType::Isochronous != self.kind() {
+        if State::Running == self.state() || rusb::TransferType::Isochronous != self.kind() {
             None
         } else {
             // SAFETY: `num_iso_packets` is never mutated
@@ -600,7 +595,7 @@ impl<C: rusb::UsbContext> Transfer<C> {
     }
 
     pub fn into_buf(mut self) -> Option<BytesMut> {
-        if State::Ready != self.state() {
+        if State::Running == self.state() {
             None
         } else {
             // Transfer is ready, therefore we can replace
@@ -611,11 +606,12 @@ impl<C: rusb::UsbContext> Transfer<C> {
     }
 
     pub fn into_parts(mut self) -> Option<(InnerTransfer, BytesMut)> {
-        if State::Ready != self.state() {
+        if State::Running == self.state() {
             None
         } else {
             let mut inner = std::mem::replace(&mut self.inner, InnerTransfer::dangling());
-            inner.clear();
+            // SAFETY: Inner transfer is no longer owned by `Transfer`.
+            unsafe { inner.clear() };
             let buf = std::mem::replace(&mut self.buf, BytesMut::new());
             Some((inner, buf))
         }
