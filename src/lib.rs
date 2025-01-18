@@ -10,8 +10,8 @@ use rusb::constants::{
 };
 use rusb::ffi::{
     libusb_alloc_transfer, libusb_cancel_transfer, libusb_fill_bulk_transfer,
-    libusb_fill_control_transfer, libusb_fill_interrupt_transfer, libusb_free_transfer,
-    libusb_iso_packet_descriptor, libusb_submit_transfer, libusb_transfer,
+    libusb_fill_control_transfer, libusb_fill_interrupt_transfer, libusb_fill_iso_transfer,
+    libusb_free_transfer, libusb_iso_packet_descriptor, libusb_submit_transfer, libusb_transfer,
 };
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
@@ -132,6 +132,30 @@ impl TransferStatus {
             LIBUSB_TRANSFER_OVERFLOW => Some(Overflow),
             _ => None,
         }
+    }
+}
+
+pub trait IsoPacket {
+    fn len(&self) -> u32;
+    fn actual_len(&self) -> u32 {
+        0
+    }
+    fn status(&self) -> TransferStatus {
+        TransferStatus::Completed
+    }
+}
+
+impl IsoPacket for libusb_iso_packet_descriptor {
+    fn len(&self) -> u32 {
+        self.length
+    }
+
+    fn actual_len(&self) -> u32 {
+        self.actual_length
+    }
+
+    fn status(&self) -> TransferStatus {
+        TransferStatus::from_i32(self.status).unwrap()
     }
 }
 
@@ -328,6 +352,61 @@ impl InnerTransfer {
                 endpoint,
                 buf.spare_capacity_mut().as_mut_ptr().cast(),
                 buf.spare_capacity_mut().len() as i32,
+                transfer_callback,
+                user_data.cast(),
+                u32::MAX,
+            );
+        }
+
+        Transfer::new(self, rx, buf)
+    }
+
+    /// # Safety
+    ///
+    /// The caller must ensure that the capacity of `buf` is exactly
+    /// the size of the buffer they want passed to the USB device. Furthermore,
+    /// since this is an isochronous transfer, the contents of `buf` must match
+    /// the sections labeled in `iso_packets`.
+    ///
+    /// Regardless if `buf` contains initialized data, its length will be set to 0
+    /// so that the entire slice can be passed to `libusb_fill_interrupt_transfer`
+    /// as a `*mut MaybeUninit<u8>`.
+    /// 
+    /// # Panics
+    /// 
+    /// This function panics if `iso_packets.len() > self.num_iso_packets()`.
+    pub unsafe fn into_iso<C: rusb::UsbContext, T: IsoPacket>(
+        mut self,
+        dev_handle: &rusb::DeviceHandle<C>,
+        endpoint: u8,
+        mut buf: BytesMut,
+        iso_packets: impl ExactSizeIterator<Item = T>,
+    ) -> Transfer<C> {
+        let num_iso_packets = iso_packets.len();
+        assert!(num_iso_packets <= self.num_iso_packets());
+        debug_assert_eq!(size_of::<Box<Notifier>>(), size_of::<*mut c_void>());
+        let (tx, rx) = mpsc::channel(1);
+        let user_data: *mut Notifier = Box::into_raw(Box::new((tx, Mutex::default())));
+
+        buf.clear();
+
+        let iso_pkts = std::slice::from_raw_parts_mut(
+            self.as_mut().iso_packet_desc.as_mut_ptr(),
+            self.as_mut().num_iso_packets as usize,
+        );
+        iso_packets
+            .map(|pkt| pkt.len())
+            .zip(iso_pkts)
+            .for_each(|(len, pkt)| pkt.length = len);
+
+        unsafe {
+            libusb_fill_iso_transfer(
+                self.as_raw(),
+                dev_handle.as_raw(),
+                endpoint,
+                buf.spare_capacity_mut().as_mut_ptr().cast(),
+                buf.spare_capacity_mut().len() as i32,
+                num_iso_packets as i32,
                 transfer_callback,
                 user_data.cast(),
                 u32::MAX,
@@ -575,7 +654,7 @@ impl<C: rusb::UsbContext> Transfer<C> {
 
     /// Returns `None` if the transfer type is not isochronous or if
     /// the transfer is not ready.
-    pub fn iso_packets(&self) -> Option<&[libusb_iso_packet_descriptor]> {
+    pub fn iso_packets(&self) -> Option<&[impl IsoPacket]> {
         if State::Running == self.state() || rusb::TransferType::Isochronous != self.kind() {
             None
         } else {
