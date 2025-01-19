@@ -371,9 +371,9 @@ impl InnerTransfer {
     /// Regardless if `buf` contains initialized data, its length will be set to 0
     /// so that the entire slice can be passed to `libusb_fill_interrupt_transfer`
     /// as a `*mut MaybeUninit<u8>`.
-    /// 
+    ///
     /// # Panics
-    /// 
+    ///
     /// This function panics if `iso_packets.len() > self.num_iso_packets()`.
     pub unsafe fn into_iso<C: rusb::UsbContext, T: IsoPacket>(
         mut self,
@@ -702,7 +702,11 @@ impl<C: rusb::UsbContext> Drop for Transfer<C> {
         match self.state() {
             State::Running => {
                 _ = self.cancel();
-                _ = self.notifier.blocking_recv();
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    handle.block_on(self.notifier.recv());
+                } else {
+                    _ = self.notifier.blocking_recv();
+                }
             }
             State::Idle | State::Ready => (),
         }
