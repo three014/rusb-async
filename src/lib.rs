@@ -21,6 +21,8 @@ use tokio_util::sync::CancellationToken;
 
 use zerocopy_derive::*;
 
+pub use dma::{AllocError, DeviceHandleExt, UsbMemMut};
+
 mod dma;
 
 type Notifier = (mpsc::Sender<()>, Mutex<State>);
@@ -57,6 +59,10 @@ impl<T: ?Sized> Ptr<T> {
 
     pub(crate) const unsafe fn as_mut(&mut self) -> &mut T {
         unsafe { self.pointer.as_mut() }
+    }
+
+    pub(crate) const fn as_non_null_ptr(self) -> NonNull<T> {
+        self.pointer
     }
 }
 
