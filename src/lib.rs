@@ -425,8 +425,8 @@ impl InnerTransfer {
 
 impl Drop for InnerTransfer {
     fn drop(&mut self) {
-        // The only time the transfer needs to call its drop
-        // impl is when it's not owned by any other struct.
+        // This will only be false when
+        // we need a "dangling" version of InnerTransfer
         if self.needs_drop {
             unsafe {
                 let user_data: *mut Notifier = self.as_ref().user_data.cast();
@@ -448,9 +448,7 @@ impl Drop for InnerTransfer {
 
 #[derive(Debug)]
 pub struct Transfer<C: rusb::UsbContext> {
-    inner: InnerTransfer,
-    notifier: Receiver,
-    buf: BytesMut,
+    data: Option<(InnerTransfer, Receiver, BytesMut)>,
     _ctx: PhantomData<C>,
 }
 
@@ -459,11 +457,21 @@ unsafe impl<C: rusb::UsbContext> Send for Transfer<C> {}
 impl<C: rusb::UsbContext> Transfer<C> {
     pub(crate) fn new(inner: InnerTransfer, notifier: Receiver, buf: BytesMut) -> Self {
         Self {
-            inner,
-            notifier,
-            buf,
+            data: Some((inner, notifier, buf)),
             _ctx: PhantomData,
         }
+    }
+
+    const fn inner(&self) -> &InnerTransfer {
+        &self.data.as_ref().unwrap().0
+    }
+
+    fn notifier_mut(&mut self) -> &mut Receiver {
+        &mut self.data.as_mut().unwrap().1
+    }
+
+    fn bytes_mut(&mut self) -> &mut BytesMut {
+        &mut self.data.as_mut().unwrap().2
     }
 
     fn state(&self) -> State {
@@ -472,7 +480,7 @@ impl<C: rusb::UsbContext> Transfer<C> {
         //         to them.
         unsafe {
             *self
-                .inner
+                .inner()
                 .as_ref()
                 .user_data
                 .cast::<Notifier>()
@@ -489,7 +497,7 @@ impl<C: rusb::UsbContext> Transfer<C> {
         //         and no one takes a mutable reference
         //         to them.
         unsafe {
-            self.inner
+            self.inner()
                 .as_ref()
                 .user_data
                 .cast::<Notifier>()
@@ -532,7 +540,7 @@ impl<C: rusb::UsbContext> Transfer<C> {
     ) -> Result<TransferStatus, rusb::Error> {
         if State::Ready == self.state() {
             // SAFETY: Transfer is ready, therefore libusb is no longer mutating `status`
-            let status = TransferStatus::from_i32(unsafe { self.inner.as_ref().status }).unwrap();
+            let status = TransferStatus::from_i32(unsafe { self.inner().as_ref().status }).unwrap();
             return Ok(status);
         }
 
@@ -558,11 +566,11 @@ impl<C: rusb::UsbContext> Transfer<C> {
 
         if let Event::Cancelled = tokio::select! {
             biased;
-            _ = self.notifier.recv() => Event::Completed,
+            _ = self.notifier_mut().recv() => Event::Completed,
             _ = cancel_token.cancelled() => Event::Cancelled,
         } {
             if self.cancel().is_ok() {
-                self.notifier.recv().await.unwrap();
+                self.notifier_mut().recv().await.unwrap();
             }
         };
 
@@ -573,15 +581,15 @@ impl<C: rusb::UsbContext> Transfer<C> {
         //         pointer, making it safe to access.
         unsafe {
             // Update BytesMut with the new buffer length from transfer
-            let transfer_ref = self.inner.as_ref();
+            let transfer_ref = self.inner().as_ref();
             let mut transfer_len = transfer_ref.actual_length as usize;
             if LIBUSB_TRANSFER_TYPE_CONTROL == transfer_ref.transfer_type {
                 transfer_len += size_of::<ControlPacket>();
             }
-            self.buf.set_len(transfer_len);
-
             // Get status from transfer
             let status = TransferStatus::from_i32(transfer_ref.status).unwrap();
+
+            self.bytes_mut().set_len(transfer_len);
 
             Ok(status)
         }
@@ -596,7 +604,7 @@ impl<C: rusb::UsbContext> Transfer<C> {
         //         of self's lifetime. Also, caller ensures that
         //         the transfer buffer points to the right data for
         //         this transfer type.
-        let result = unsafe { libusb_submit_transfer(self.inner.as_raw()) };
+        let result = unsafe { libusb_submit_transfer(self.inner().as_raw()) };
         if 0 != result {
             Err(from_libusb(result))
         } else {
@@ -607,7 +615,7 @@ impl<C: rusb::UsbContext> Transfer<C> {
     fn cancel(&mut self) -> Result<(), rusb::Error> {
         // SAFETY: `self.inner` is a valid pointer
         //         for the entirety of self's lifetime.
-        let result = unsafe { libusb_cancel_transfer(self.inner.as_raw()) };
+        let result = unsafe { libusb_cancel_transfer(self.inner().as_raw()) };
         if 0 != result {
             Err(from_libusb(result))
         } else {
@@ -620,13 +628,13 @@ impl<C: rusb::UsbContext> Transfer<C> {
     pub const fn timeout(&self) -> Duration {
         // SAFETY: `self.inner` is a valid and initialized
         //         pointer to a `libusb_transfer`.
-        unsafe { Duration::from_millis(self.inner.as_ref().timeout as u64) }
+        unsafe { Duration::from_millis(self.inner().as_ref().timeout as u64) }
     }
 
     /// Returns the transfer's `rusb::TransferType`.
     pub const fn kind(&self) -> rusb::TransferType {
         unsafe {
-            match self.inner.as_ref().transfer_type {
+            match self.inner().as_ref().transfer_type {
                 LIBUSB_TRANSFER_TYPE_CONTROL => rusb::TransferType::Control,
                 LIBUSB_TRANSFER_TYPE_INTERRUPT => rusb::TransferType::Interrupt,
                 LIBUSB_TRANSFER_TYPE_BULK => rusb::TransferType::Bulk,
@@ -643,7 +651,7 @@ impl<C: rusb::UsbContext> Transfer<C> {
         if State::Running == self.state() {
             None
         } else {
-            Some(&self.buf)
+            Some(self.bytes())
         }
     }
 
@@ -654,7 +662,7 @@ impl<C: rusb::UsbContext> Transfer<C> {
         if State::Running == self.state() {
             None
         } else {
-            Some(&mut self.buf)
+            Some(self.bytes_mut())
         }
     }
 
@@ -671,8 +679,8 @@ impl<C: rusb::UsbContext> Transfer<C> {
             //         we are the only place referencing this data.
             let packets = unsafe {
                 std::slice::from_raw_parts(
-                    self.inner.as_ref().iso_packet_desc.as_ptr(),
-                    self.inner.as_ref().num_iso_packets as usize,
+                    self.inner().as_ref().iso_packet_desc.as_ptr(),
+                    self.inner().as_ref().num_iso_packets as usize,
                 )
             };
             Some(packets)
@@ -683,10 +691,7 @@ impl<C: rusb::UsbContext> Transfer<C> {
         if State::Running == self.state() {
             None
         } else {
-            // Transfer is ready, therefore we can replace
-            // self.buf with an empty BytesMut.
-            let buf = std::mem::replace(&mut self.buf, BytesMut::new());
-            Some(buf)
+            self.data.take().map(|(_, _, bytes_mut)| bytes_mut)
         }
     }
 
@@ -694,12 +699,15 @@ impl<C: rusb::UsbContext> Transfer<C> {
         if State::Running == self.state() {
             None
         } else {
-            let mut inner = std::mem::replace(&mut self.inner, InnerTransfer::dangling());
+            let (mut inner, _, buf) = self.data.take().unwrap();
             // SAFETY: Inner transfer is no longer owned by `Transfer`.
             unsafe { inner.clear() };
-            let buf = std::mem::replace(&mut self.buf, BytesMut::new());
             Some((inner, buf))
         }
+    }
+
+    fn bytes(&self) -> &BytesMut {
+        &self.data.as_ref().unwrap().2
     }
 }
 
@@ -709,9 +717,14 @@ impl<C: rusb::UsbContext> Drop for Transfer<C> {
             State::Running => {
                 _ = self.cancel();
                 if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                    handle.block_on(self.notifier.recv());
+                    let (inner, mut notifier, buf) = self.data.take().unwrap();
+                    handle.spawn(async move {
+                        notifier.recv().await;
+                        let _ = inner;
+                        let _ = buf;
+                    });
                 } else {
-                    _ = self.notifier.blocking_recv();
+                    _ = self.notifier_mut().blocking_recv();
                 }
             }
             State::Idle | State::Ready => (),
