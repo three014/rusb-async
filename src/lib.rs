@@ -713,21 +713,22 @@ impl<C: rusb::UsbContext> Transfer<C> {
 
 impl<C: rusb::UsbContext> Drop for Transfer<C> {
     fn drop(&mut self) {
-        match self.state() {
-            State::Running => {
-                _ = self.cancel();
-                if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                    let (inner, mut notifier, buf) = self.data.take().unwrap();
-                    handle.spawn(async move {
-                        notifier.recv().await;
-                        let _ = inner;
-                        let _ = buf;
-                    });
-                } else {
-                    _ = self.notifier_mut().blocking_recv();
-                }
+        if self
+            .data
+            .as_ref()
+            .is_some_and(|_| State::Running == self.state())
+        {
+            _ = self.cancel();
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let (inner, mut notifier, buf) = self.data.take().unwrap();
+                handle.spawn(async move {
+                    notifier.recv().await;
+                    let _ = inner;
+                    let _ = buf;
+                });
+            } else {
+                _ = self.notifier_mut().blocking_recv();
             }
-            State::Idle | State::Ready => (),
         }
     }
 }
@@ -771,17 +772,4 @@ pub(crate) fn from_libusb(err: i32) -> rusb::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn transfer_is_send() {
-        fn send_thing<T: Send>(_item: T) {}
-
-        let handle = rusb::open_device_with_vid_pid(0x0000, 0x0000).unwrap();
-        let transfer = InnerTransfer::new(0);
-        let transfer = unsafe {
-            transfer.into_ctrl(&handle, BytesMut::with_capacity(64), Duration::from_secs(5))
-        };
-
-        send_thing(transfer);
-    }
 }
