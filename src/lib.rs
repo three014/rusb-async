@@ -1,12 +1,6 @@
 use bytes::BytesMut;
 use rusb::constants::{
-    LIBUSB_ERROR_ACCESS, LIBUSB_ERROR_BUSY, LIBUSB_ERROR_INTERRUPTED, LIBUSB_ERROR_INVALID_PARAM,
-    LIBUSB_ERROR_IO, LIBUSB_ERROR_NOT_FOUND, LIBUSB_ERROR_NOT_SUPPORTED, LIBUSB_ERROR_NO_DEVICE,
-    LIBUSB_ERROR_NO_MEM, LIBUSB_ERROR_OTHER, LIBUSB_ERROR_OVERFLOW, LIBUSB_ERROR_PIPE,
-    LIBUSB_ERROR_TIMEOUT, LIBUSB_TRANSFER_CANCELLED, LIBUSB_TRANSFER_COMPLETED,
-    LIBUSB_TRANSFER_ERROR, LIBUSB_TRANSFER_NO_DEVICE, LIBUSB_TRANSFER_OVERFLOW,
-    LIBUSB_TRANSFER_STALL, LIBUSB_TRANSFER_TIMED_OUT, LIBUSB_TRANSFER_TYPE_BULK,
-    LIBUSB_TRANSFER_TYPE_CONTROL, LIBUSB_TRANSFER_TYPE_INTERRUPT, LIBUSB_TRANSFER_TYPE_ISOCHRONOUS,
+    LIBUSB_ERROR_ACCESS, LIBUSB_ERROR_BUSY, LIBUSB_ERROR_INTERRUPTED, LIBUSB_ERROR_INVALID_PARAM, LIBUSB_ERROR_IO, LIBUSB_ERROR_NOT_FOUND, LIBUSB_ERROR_NOT_SUPPORTED, LIBUSB_ERROR_NO_DEVICE, LIBUSB_ERROR_NO_MEM, LIBUSB_ERROR_OTHER, LIBUSB_ERROR_OVERFLOW, LIBUSB_ERROR_PIPE, LIBUSB_ERROR_TIMEOUT, LIBUSB_TRANSFER_ADD_ZERO_PACKET, LIBUSB_TRANSFER_CANCELLED, LIBUSB_TRANSFER_COMPLETED, LIBUSB_TRANSFER_ERROR, LIBUSB_TRANSFER_NO_DEVICE, LIBUSB_TRANSFER_OVERFLOW, LIBUSB_TRANSFER_SHORT_NOT_OK, LIBUSB_TRANSFER_STALL, LIBUSB_TRANSFER_TIMED_OUT, LIBUSB_TRANSFER_TYPE_BULK, LIBUSB_TRANSFER_TYPE_CONTROL, LIBUSB_TRANSFER_TYPE_INTERRUPT, LIBUSB_TRANSFER_TYPE_ISOCHRONOUS
 };
 use rusb::ffi::{
     libusb_alloc_transfer, libusb_cancel_transfer, libusb_fill_bulk_transfer,
@@ -113,7 +107,7 @@ pub struct ControlPacket {
     pub w_length: u16,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, IntoBytes, FromZeros)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, IntoBytes, FromZeros, Unaligned, KnownLayout)]
 #[repr(u8)]
 pub enum TransferStatus {
     Completed = 0,
@@ -141,6 +135,16 @@ impl TransferStatus {
     }
 }
 
+
+bitflags::bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct TransferFlags: u8 {
+        const NONE = 0;
+        const SHORT_NOT_OK = LIBUSB_TRANSFER_SHORT_NOT_OK;
+        const ADD_ZERO_PACKET = LIBUSB_TRANSFER_ADD_ZERO_PACKET;
+    }
+}
+
 pub trait IsoPacket {
     fn len(&self) -> u32;
     fn actual_len(&self) -> u32 {
@@ -164,6 +168,8 @@ impl IsoPacket for libusb_iso_packet_descriptor {
         TransferStatus::from_i32(self.status).unwrap()
     }
 }
+
+const _: [u8; size_of::<Box<Notifier>>() - size_of::<*mut c_void>()] = [];
 
 #[derive(Debug)]
 pub struct InnerTransfer {
@@ -253,7 +259,6 @@ impl InnerTransfer {
         endpoint: u8,
         mut buf: BytesMut,
     ) -> Transfer<C> {
-        debug_assert_eq!(size_of::<Box<Notifier>>(), size_of::<*mut c_void>());
         let (tx, rx) = mpsc::channel(1);
         let user_data: *mut Notifier = Box::into_raw(Box::new((tx, Mutex::default())));
 
@@ -304,7 +309,6 @@ impl InnerTransfer {
         mut buf: BytesMut,
         timeout: Duration,
     ) -> Transfer<C> {
-        debug_assert_eq!(size_of::<Box<Notifier>>(), size_of::<*mut c_void>());
         let (tx, rx) = mpsc::channel(1);
         let user_data: *mut Notifier = Box::into_raw(Box::new((tx, Mutex::default())));
         let timeout = timeout.clamp(Duration::ZERO, Duration::from_millis(u32::MAX as u64));
@@ -343,10 +347,9 @@ impl InnerTransfer {
         mut self,
         dev_handle: &rusb::DeviceHandle<C>,
         endpoint: u8,
-        flags: Option<u8>,
+        flags: TransferFlags,
         mut buf: BytesMut,
     ) -> Transfer<C> {
-        debug_assert_eq!(size_of::<Box<Notifier>>(), size_of::<*mut c_void>());
         let (tx, rx) = mpsc::channel(1);
         let user_data: *mut Notifier = Box::into_raw(Box::new((tx, Mutex::default())));
 
@@ -364,9 +367,7 @@ impl InnerTransfer {
                 u32::MAX,
             );
 
-            if let Some(flags) = flags {
-                self.as_mut().flags = flags;
-            }
+            self.as_mut().flags = flags.bits();
         }
 
         Transfer::new(self, rx, buf)
@@ -395,7 +396,6 @@ impl InnerTransfer {
     ) -> Transfer<C> {
         let num_iso_packets = iso_packets.len();
         assert!(num_iso_packets <= self.num_iso_packets());
-        debug_assert_eq!(size_of::<Box<Notifier>>(), size_of::<*mut c_void>());
         let (tx, rx) = mpsc::channel(1);
         let user_data: *mut Notifier = Box::into_raw(Box::new((tx, Mutex::default())));
 
