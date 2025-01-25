@@ -340,9 +340,10 @@ impl InnerTransfer {
     /// so that the entire slice can be passed to `libusb_fill_interrupt_transfer`
     /// as a `*mut MaybeUninit<u8>`.
     pub unsafe fn into_bulk<C: rusb::UsbContext>(
-        self,
+        mut self,
         dev_handle: &rusb::DeviceHandle<C>,
         endpoint: u8,
+        flags: Option<u8>,
         mut buf: BytesMut,
     ) -> Transfer<C> {
         debug_assert_eq!(size_of::<Box<Notifier>>(), size_of::<*mut c_void>());
@@ -362,6 +363,10 @@ impl InnerTransfer {
                 user_data.cast(),
                 u32::MAX,
             );
+
+            if let Some(flags) = flags {
+                self.as_mut().flags = flags;
+            }
         }
 
         Transfer::new(self, rx, buf)
