@@ -159,7 +159,7 @@ dependencies = [
 
 [[package]]
 name = "rusb_async"
-version = "0.1.2"
+version = "0.1.4"
 dependencies = [
  "bitflags",
  "bytes",

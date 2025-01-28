@@ -428,6 +428,8 @@ impl InnerTransfer {
     }
 }
 
+unsafe impl Send for InnerTransfer {}
+
 impl Drop for InnerTransfer {
     fn drop(&mut self) {
         // This will only be false when
