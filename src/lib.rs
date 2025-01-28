@@ -302,7 +302,7 @@ impl InnerTransfer {
     ///
     /// Regardless how much of `buf` contains initialized data, its length will
     /// be set to 0 so that the entire slice can be passed to
-    /// `libusb_fill_interrupt_transfer` as a `*mut MaybeUninit<u8>`.
+    /// `libusb_fill_control_transfer` as a `*mut MaybeUninit<u8>`.
     pub unsafe fn into_ctrl<C: rusb::UsbContext>(
         self,
         dev_handle: &rusb::DeviceHandle<C>,
@@ -341,7 +341,7 @@ impl InnerTransfer {
     /// the size of the buffer they want passed to the USB device.
     ///
     /// Regardless if `buf` contains initialized data, its length will be set to 0
-    /// so that the entire slice can be passed to `libusb_fill_interrupt_transfer`
+    /// so that the entire slice can be passed to `libusb_fill_bulk_transfer`
     /// as a `*mut MaybeUninit<u8>`.
     pub unsafe fn into_bulk<C: rusb::UsbContext>(
         mut self,
@@ -381,7 +381,7 @@ impl InnerTransfer {
     /// the sections labeled in `iso_packets`.
     ///
     /// Regardless if `buf` contains initialized data, its length will be set to 0
-    /// so that the entire slice can be passed to `libusb_fill_interrupt_transfer`
+    /// so that the entire slice can be passed to `libusb_fill_iso_transfer`
     /// as a `*mut MaybeUninit<u8>`.
     ///
     /// # Panics
@@ -745,13 +745,20 @@ extern "system" fn transfer_callback(transfer: *mut libusb_transfer) {
     //         `user_data`. `user_data` is a valid `Box<Notifier>` pointer
     //         created from `Box::into_raw`, and can be turned back into
     //         a box.
-    let notifier = unsafe {
+    let (notifier, state) = unsafe {
         let user_data: *const Notifier = transfer.as_ref().unwrap().user_data.cast();
         user_data.as_ref().unwrap()
     };
 
-    _ = notifier.0.blocking_send(());
-    *notifier.1.lock().unwrap() = State::Ready;
+    // Potential race condition here:
+    //
+    // After notifying the caller, caller can lock the mutex before we get
+    // a chance to lock the mutex, leading to weird stuff happening.
+    // Therefore we hold the lock while sending our signal so that the next
+    // thread that views the state will see the correct state.
+    let mut state = state.lock().unwrap();
+    _ = notifier.blocking_send(());
+    *state = State::Ready;
 }
 
 extern "system" fn dummy_callback(_: *mut libusb_transfer) {}
