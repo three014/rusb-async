@@ -1,14 +1,21 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use bytes::{BufMut, BytesMut};
-use rusb::UsbContext;
-use rusb_async::{ControlPacket, Transfer};
+use bytes::BufMut;
+use rusb::{constants::LIBUSB_REQUEST_GET_DESCRIPTOR, UsbContext};
+use rusb_async::{ControlPacket, DeviceHandleExt, InnerTransfer};
 use tokio_util::sync::CancellationToken;
 use zerocopy::IntoBytes;
 
 fn main() {
     let ctx = rusb::Context::new().unwrap();
-    let handle = ctx.open_device_with_vid_pid(0x0c45, 0x7016).unwrap();
+    let handle = ctx
+        .devices()
+        .unwrap()
+        .iter()
+        .find(|dev| dev.bus_number() == 3 && dev.address() == 36)
+        .unwrap()
+        .open()
+        .unwrap();
 
     handle.set_auto_detach_kernel_driver(true).unwrap();
     for interface in 0..16 {
@@ -20,22 +27,28 @@ fn main() {
     let ctx = handle.context().clone();
     handle.reset().unwrap();
 
-    let mut buf = BytesMut::with_capacity(size_of::<ControlPacket>() + 18);
-    buf.put_bytes(0, size_of::<ControlPacket>());
+    let needed = size_of::<ControlPacket>() + 18;
+    let now = Instant::now();
+    let mut buf = unsafe { handle.new_usb_mem(0x16000).unwrap() };
+    let elapsed = now.elapsed();
+    println!("took {elapsed:?} to map memory");
+    unsafe { buf.set_len(needed) };
+    let mut buf = buf.split_to(needed);
     let pkt = ControlPacket {
         bm_request_type: rusb::request_type(
             rusb::Direction::In,
             rusb::RequestType::Standard,
             rusb::Recipient::Device,
         ),
-        b_request: 0x06,
-        w_value: 0x01,
+        b_request: LIBUSB_REQUEST_GET_DESCRIPTOR,
+        w_value: 1 << 8,
         w_index: 0,
         w_length: 18,
     };
     pkt.write_to_prefix(&mut buf[..]).unwrap();
 
-    let mut transfer = unsafe { Transfer::new_ctrl(&handle, buf, Duration::from_millis(600)) };
+    let mut transfer =
+        unsafe { InnerTransfer::new(0).into_ctrl(&handle, buf, Duration::from_millis(600)) };
 
     let cancel_token = CancellationToken::new();
     let event_handler = cancel_token.clone();
@@ -55,6 +68,9 @@ fn main() {
         println!("about to run transfer");
         let result = transfer.submit(cancel_transfer2).await;
         println!("{result:?}");
+        if result.is_ok() {
+            println!("{:?}", transfer.into_buf().unwrap());
+        }
     });
 
     println!("stopping event handler");

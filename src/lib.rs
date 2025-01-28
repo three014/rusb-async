@@ -1,4 +1,3 @@
-use bytes::BytesMut;
 use rusb::constants::{
     LIBUSB_ERROR_ACCESS, LIBUSB_ERROR_BUSY, LIBUSB_ERROR_INTERRUPTED, LIBUSB_ERROR_INVALID_PARAM, LIBUSB_ERROR_IO, LIBUSB_ERROR_NOT_FOUND, LIBUSB_ERROR_NOT_SUPPORTED, LIBUSB_ERROR_NO_DEVICE, LIBUSB_ERROR_NO_MEM, LIBUSB_ERROR_OTHER, LIBUSB_ERROR_OVERFLOW, LIBUSB_ERROR_PIPE, LIBUSB_ERROR_TIMEOUT, LIBUSB_TRANSFER_ADD_ZERO_PACKET, LIBUSB_TRANSFER_CANCELLED, LIBUSB_TRANSFER_COMPLETED, LIBUSB_TRANSFER_ERROR, LIBUSB_TRANSFER_NO_DEVICE, LIBUSB_TRANSFER_OVERFLOW, LIBUSB_TRANSFER_SHORT_NOT_OK, LIBUSB_TRANSFER_STALL, LIBUSB_TRANSFER_TIMED_OUT, LIBUSB_TRANSFER_TYPE_BULK, LIBUSB_TRANSFER_TYPE_CONTROL, LIBUSB_TRANSFER_TYPE_INTERRUPT, LIBUSB_TRANSFER_TYPE_ISOCHRONOUS
 };
@@ -135,7 +134,6 @@ impl TransferStatus {
     }
 }
 
-
 bitflags::bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct TransferFlags: u8 {
@@ -257,7 +255,7 @@ impl InnerTransfer {
         self,
         dev_handle: &rusb::DeviceHandle<C>,
         endpoint: u8,
-        mut buf: BytesMut,
+        mut buf: UsbMemMut,
     ) -> Transfer<C> {
         let (tx, rx) = mpsc::channel(1);
         let user_data: *mut Notifier = Box::into_raw(Box::new((tx, Mutex::default())));
@@ -306,7 +304,7 @@ impl InnerTransfer {
     pub unsafe fn into_ctrl<C: rusb::UsbContext>(
         self,
         dev_handle: &rusb::DeviceHandle<C>,
-        mut buf: BytesMut,
+        mut buf: UsbMemMut,
         timeout: Duration,
     ) -> Transfer<C> {
         let (tx, rx) = mpsc::channel(1);
@@ -348,7 +346,7 @@ impl InnerTransfer {
         dev_handle: &rusb::DeviceHandle<C>,
         endpoint: u8,
         flags: TransferFlags,
-        mut buf: BytesMut,
+        mut buf: UsbMemMut,
     ) -> Transfer<C> {
         let (tx, rx) = mpsc::channel(1);
         let user_data: *mut Notifier = Box::into_raw(Box::new((tx, Mutex::default())));
@@ -391,7 +389,7 @@ impl InnerTransfer {
         mut self,
         dev_handle: &rusb::DeviceHandle<C>,
         endpoint: u8,
-        mut buf: BytesMut,
+        mut buf: UsbMemMut,
         iso_packets: impl ExactSizeIterator<Item = T>,
     ) -> Transfer<C> {
         let num_iso_packets = iso_packets.len();
@@ -455,14 +453,14 @@ impl Drop for InnerTransfer {
 
 #[derive(Debug)]
 pub struct Transfer<C: rusb::UsbContext> {
-    data: Option<(InnerTransfer, Receiver, BytesMut)>,
+    data: Option<(InnerTransfer, Receiver, UsbMemMut)>,
     _ctx: PhantomData<C>,
 }
 
 unsafe impl<C: rusb::UsbContext> Send for Transfer<C> {}
 
 impl<C: rusb::UsbContext> Transfer<C> {
-    pub(crate) fn new(inner: InnerTransfer, notifier: Receiver, buf: BytesMut) -> Self {
+    pub(crate) fn new(inner: InnerTransfer, notifier: Receiver, buf: UsbMemMut) -> Self {
         Self {
             data: Some((inner, notifier, buf)),
             _ctx: PhantomData,
@@ -477,7 +475,7 @@ impl<C: rusb::UsbContext> Transfer<C> {
         &mut self.data.as_mut().unwrap().1
     }
 
-    fn bytes_mut(&mut self) -> &mut BytesMut {
+    fn bytes_mut(&mut self) -> &mut UsbMemMut {
         &mut self.data.as_mut().unwrap().2
     }
 
@@ -553,7 +551,7 @@ impl<C: rusb::UsbContext> Transfer<C> {
 
         // SAFETY: We hold exclusive mutable access to `self`.
         //         Therefore, we can prevent anyone else from
-        //         accessing the BytesMut and the inner transfer
+        //         accessing the UsbMemMut and the inner transfer
         //         while libusb uses the data.
         match unsafe { self.inner_submit() } {
             Ok(_) => {
@@ -587,7 +585,7 @@ impl<C: rusb::UsbContext> Transfer<C> {
         //         Furthermore, transfer is a well-aligned and valid
         //         pointer, making it safe to access.
         unsafe {
-            // Update BytesMut with the new buffer length from transfer
+            // Update UsbMemMut with the new buffer length from transfer
             let transfer_ref = self.inner().as_ref();
             let mut transfer_len = transfer_ref.actual_length as usize;
             if LIBUSB_TRANSFER_TYPE_CONTROL == transfer_ref.transfer_type {
@@ -694,7 +692,7 @@ impl<C: rusb::UsbContext> Transfer<C> {
         }
     }
 
-    pub fn into_buf(mut self) -> Option<BytesMut> {
+    pub fn into_buf(mut self) -> Option<UsbMemMut> {
         if State::Running == self.state() {
             None
         } else {
@@ -702,7 +700,7 @@ impl<C: rusb::UsbContext> Transfer<C> {
         }
     }
 
-    pub fn into_parts(mut self) -> Option<(InnerTransfer, BytesMut)> {
+    pub fn into_parts(mut self) -> Option<(InnerTransfer, UsbMemMut)> {
         if State::Running == self.state() {
             None
         } else {
@@ -713,7 +711,7 @@ impl<C: rusb::UsbContext> Transfer<C> {
         }
     }
 
-    fn bytes(&self) -> &BytesMut {
+    fn bytes(&self) -> &UsbMemMut {
         &self.data.as_ref().unwrap().2
     }
 }

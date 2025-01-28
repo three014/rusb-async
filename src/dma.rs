@@ -1,5 +1,5 @@
 use core::slice;
-use std::{borrow::{Borrow, BorrowMut}, cmp, mem::MaybeUninit, ops::{Deref, DerefMut}, ptr::NonNull, sync::Arc};
+use std::{borrow::{Borrow, BorrowMut}, cmp, fmt::Debug, mem::MaybeUninit, ops::{Deref, DerefMut}, ptr::NonNull, sync::Arc};
 
 use bytes::buf::IntoIter;
 use ::bytes::{Buf, BufMut};
@@ -12,6 +12,12 @@ pub struct UsbMemMut {
     len: usize,
     cap: usize,
     data: Option<Arc<RawUsbMem>>,
+}
+
+impl std::fmt::Debug for UsbMemMut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.as_ref().fmt(f)
+    }
 }
 
 impl UsbMemMut {
