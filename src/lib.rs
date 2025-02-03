@@ -1,15 +1,22 @@
 use rusb::constants::{
-    LIBUSB_ERROR_ACCESS, LIBUSB_ERROR_BUSY, LIBUSB_ERROR_INTERRUPTED, LIBUSB_ERROR_INVALID_PARAM, LIBUSB_ERROR_IO, LIBUSB_ERROR_NOT_FOUND, LIBUSB_ERROR_NOT_SUPPORTED, LIBUSB_ERROR_NO_DEVICE, LIBUSB_ERROR_NO_MEM, LIBUSB_ERROR_OTHER, LIBUSB_ERROR_OVERFLOW, LIBUSB_ERROR_PIPE, LIBUSB_ERROR_TIMEOUT, LIBUSB_TRANSFER_ADD_ZERO_PACKET, LIBUSB_TRANSFER_CANCELLED, LIBUSB_TRANSFER_COMPLETED, LIBUSB_TRANSFER_ERROR, LIBUSB_TRANSFER_NO_DEVICE, LIBUSB_TRANSFER_OVERFLOW, LIBUSB_TRANSFER_SHORT_NOT_OK, LIBUSB_TRANSFER_STALL, LIBUSB_TRANSFER_TIMED_OUT, LIBUSB_TRANSFER_TYPE_BULK, LIBUSB_TRANSFER_TYPE_CONTROL, LIBUSB_TRANSFER_TYPE_INTERRUPT, LIBUSB_TRANSFER_TYPE_ISOCHRONOUS
+    LIBUSB_ERROR_ACCESS, LIBUSB_ERROR_BUSY, LIBUSB_ERROR_INTERRUPTED, LIBUSB_ERROR_INVALID_PARAM,
+    LIBUSB_ERROR_IO, LIBUSB_ERROR_NOT_FOUND, LIBUSB_ERROR_NOT_SUPPORTED, LIBUSB_ERROR_NO_DEVICE,
+    LIBUSB_ERROR_NO_MEM, LIBUSB_ERROR_OTHER, LIBUSB_ERROR_OVERFLOW, LIBUSB_ERROR_PIPE,
+    LIBUSB_ERROR_TIMEOUT, LIBUSB_TRANSFER_ADD_ZERO_PACKET, LIBUSB_TRANSFER_CANCELLED,
+    LIBUSB_TRANSFER_COMPLETED, LIBUSB_TRANSFER_ERROR, LIBUSB_TRANSFER_NO_DEVICE,
+    LIBUSB_TRANSFER_OVERFLOW, LIBUSB_TRANSFER_SHORT_NOT_OK, LIBUSB_TRANSFER_STALL,
+    LIBUSB_TRANSFER_TIMED_OUT, LIBUSB_TRANSFER_TYPE_BULK, LIBUSB_TRANSFER_TYPE_CONTROL,
+    LIBUSB_TRANSFER_TYPE_INTERRUPT, LIBUSB_TRANSFER_TYPE_ISOCHRONOUS,
 };
 use rusb::ffi::{
     libusb_alloc_transfer, libusb_cancel_transfer, libusb_fill_bulk_transfer,
     libusb_fill_control_transfer, libusb_fill_interrupt_transfer, libusb_fill_iso_transfer,
     libusb_free_transfer, libusb_iso_packet_descriptor, libusb_submit_transfer, libusb_transfer,
 };
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use std::{ffi::c_void, marker::PhantomData, ptr::NonNull};
-use tokio::sync::mpsc;
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 use zerocopy_derive::*;
@@ -18,8 +25,8 @@ pub use dma::{AllocError, DeviceHandleExt, UsbMemMut};
 
 mod dma;
 
-type Notifier = (mpsc::Sender<()>, Mutex<State>);
-type Receiver = mpsc::Receiver<()>;
+type Notifier = (Arc<Notify>, Mutex<State>);
+type Receiver = Arc<Notify>;
 
 #[repr(transparent)]
 struct Ptr<T: ?Sized> {
@@ -257,8 +264,8 @@ impl InnerTransfer {
         endpoint: u8,
         mut buf: UsbMemMut,
     ) -> Transfer<C> {
-        let (tx, rx) = mpsc::channel(1);
-        let user_data: *mut Notifier = Box::into_raw(Box::new((tx, Mutex::default())));
+        let notify = Arc::new(Notify::const_new());
+        let user_data: *mut Notifier = Box::into_raw(Box::new((notify.clone(), Mutex::default())));
 
         // Caller ensures that buf.capacity() is the size of the buffer they
         // want passed into the transfer, so we can set the length to 0 to prevent
@@ -279,7 +286,7 @@ impl InnerTransfer {
             )
         };
 
-        Transfer::new(self, rx, buf)
+        Transfer::new(self, notify, buf)
     }
 
     /// Populates the fields of `self` with the supplied data.
@@ -307,8 +314,8 @@ impl InnerTransfer {
         mut buf: UsbMemMut,
         timeout: Duration,
     ) -> Transfer<C> {
-        let (tx, rx) = mpsc::channel(1);
-        let user_data: *mut Notifier = Box::into_raw(Box::new((tx, Mutex::default())));
+        let notify = Arc::new(Notify::const_new());
+        let user_data: *mut Notifier = Box::into_raw(Box::new((notify.clone(), Mutex::default())));
         let timeout = timeout.clamp(Duration::ZERO, Duration::from_millis(u32::MAX as u64));
 
         // Caller ensures that buf.capacity() is the size of the buffer they
@@ -328,7 +335,7 @@ impl InnerTransfer {
             )
         };
 
-        Transfer::new(self, rx, buf)
+        Transfer::new(self, notify, buf)
     }
 
     /// Populates the fields of `self` with the supplied data.
@@ -348,8 +355,8 @@ impl InnerTransfer {
         flags: TransferFlags,
         mut buf: UsbMemMut,
     ) -> Transfer<C> {
-        let (tx, rx) = mpsc::channel(1);
-        let user_data: *mut Notifier = Box::into_raw(Box::new((tx, Mutex::default())));
+        let notify = Arc::new(Notify::const_new());
+        let user_data: *mut Notifier = Box::into_raw(Box::new((notify.clone(), Mutex::default())));
 
         buf.clear();
 
@@ -368,7 +375,7 @@ impl InnerTransfer {
             self.as_mut().flags = flags.bits();
         }
 
-        Transfer::new(self, rx, buf)
+        Transfer::new(self, notify, buf)
     }
 
     /// # Safety
@@ -394,8 +401,8 @@ impl InnerTransfer {
     ) -> Transfer<C> {
         let num_iso_packets = iso_packets.len();
         assert!(num_iso_packets <= self.num_iso_packets());
-        let (tx, rx) = mpsc::channel(1);
-        let user_data: *mut Notifier = Box::into_raw(Box::new((tx, Mutex::default())));
+        let notify = Arc::new(Notify::const_new());
+        let user_data: *mut Notifier = Box::into_raw(Box::new((notify.clone(), Mutex::default())));
 
         buf.clear();
 
@@ -422,7 +429,7 @@ impl InnerTransfer {
             );
         }
 
-        Transfer::new(self, rx, buf)
+        Transfer::new(self, notify, buf)
     }
 }
 
@@ -451,6 +458,17 @@ impl Drop for InnerTransfer {
     }
 }
 
+
+/// # Safety
+///
+/// `Transfer`'s `drop` implementation will panic if the inner transfer is
+/// in progress and it cannot grab a handle to the `tokio` runtime. 
+/// It needs the runtime so it can continue to wait for the inner transfer 
+/// to complete asynchronously, then drop the buffer and inner transfer allocation.
+/// 
+/// In the above scenario, shutting down the runtime without waiting for the 
+/// newly spawned future to complete results in **undefined behavior**, as the
+/// transfer callback will most likely write to now-garbage memory.
 #[derive(Debug)]
 pub struct Transfer<C: rusb::UsbContext> {
     data: Option<(InnerTransfer, Receiver, UsbMemMut)>,
@@ -530,6 +548,13 @@ impl<C: rusb::UsbContext> Transfer<C> {
     /// - `Busy` if this is a resubmit and the buffer hadn't been reset
     /// - `Error` on general failure
     ///
+    /// # Safety
+    /// 
+    /// The caller must not drop the resulting future until completion.
+    ///
+    /// Dropping future and the tranfer does not immediately result in
+    /// undefined behavior. See struct definition for more info.
+    ///
     /// # Cancel safety
     ///
     /// If `submit` is used as an event in [`tokio::select`] and some other branch
@@ -537,9 +562,17 @@ impl<C: rusb::UsbContext> Transfer<C> {
     /// transfer to complete.
     ///
     /// If [`Transfer`] is dropped after cancelling the future,
-    /// it will send a cancellation request to libusb and block until the transfer
-    /// completes, then deallocates the transfer to prevent leaking memory/undefined behavior.
-    pub async fn submit(
+    /// it will send a cancellation request to libusb and one of three things will happen:
+    ///
+    /// 1. If the transfer is complete, then all parts of the transfer are 
+    ///    dropped/deallocated safely.
+    /// 2. If the transfer is not complete and the function can access the tokio runtime,
+    ///    then the function spawns a new future into the executor to finish polling for
+    ///    the transfer callback, then drops the rest of the transfer.
+    /// 3. If the transfer is not complete and the function can't access the tokio runtime,
+    ///    then the function panics. (TODO: Not a great alternative)
+    #[must_use = "futures do nothing unless polled"]
+    pub async unsafe fn submit(
         &mut self,
         cancel_token: CancellationToken,
     ) -> Result<TransferStatus, rusb::Error> {
@@ -571,11 +604,11 @@ impl<C: rusb::UsbContext> Transfer<C> {
 
         if let Event::Cancelled = tokio::select! {
             biased;
-            _ = self.notifier_mut().recv() => Event::Completed,
+            _ = self.notifier_mut().notified() => Event::Completed,
             _ = cancel_token.cancelled() => Event::Cancelled,
         } {
             if self.cancel().is_ok() {
-                self.notifier_mut().recv().await.unwrap();
+                self.notifier_mut().notified().await;
             }
         };
 
@@ -724,16 +757,13 @@ impl<C: rusb::UsbContext> Drop for Transfer<C> {
             .is_some_and(|_| State::Running == self.state())
         {
             _ = self.cancel();
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                let (inner, mut notifier, buf) = self.data.take().unwrap();
-                handle.spawn(async move {
-                    notifier.recv().await;
-                    let _ = inner;
-                    let _ = buf;
-                });
-            } else {
-                _ = self.notifier_mut().blocking_recv();
-            }
+            let handle = tokio::runtime::Handle::current();
+            let (inner, notifier, buf) = self.data.take().unwrap();
+            handle.spawn(async move {
+                notifier.notified().await;
+                let _ = inner;
+                let _ = buf;
+            });
         }
     }
 }
@@ -757,7 +787,7 @@ extern "system" fn transfer_callback(transfer: *mut libusb_transfer) {
     // Therefore we hold the lock while sending our signal so that the next
     // thread that views the state will see the correct state.
     let mut state = state.lock().unwrap();
-    _ = notifier.blocking_send(());
+    notifier.notify_one();
     *state = State::Ready;
 }
 
