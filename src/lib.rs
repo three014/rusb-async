@@ -607,9 +607,8 @@ impl<C: rusb::UsbContext> Transfer<C> {
             _ = self.notifier_mut().notified() => Event::Completed,
             _ = cancel_token.cancelled() => Event::Cancelled,
         } {
-            if self.cancel().is_ok() {
-                self.notifier_mut().notified().await;
-            }
+            _ = self.cancel();
+            self.notifier_mut().recv().await.unwrap();
         };
 
         // SAFETY: libusb has completed the transfer and is no
