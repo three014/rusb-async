@@ -9,9 +9,9 @@ use rusb::constants::{
     LIBUSB_TRANSFER_TYPE_INTERRUPT, LIBUSB_TRANSFER_TYPE_ISOCHRONOUS,
 };
 use rusb::ffi::{
-    libusb_alloc_transfer, libusb_cancel_transfer, libusb_fill_bulk_transfer,
-    libusb_fill_control_transfer, libusb_fill_interrupt_transfer, libusb_fill_iso_transfer,
-    libusb_free_transfer, libusb_iso_packet_descriptor, libusb_submit_transfer, libusb_transfer,
+    libusb_alloc_transfer, libusb_fill_bulk_transfer, libusb_fill_control_transfer,
+    libusb_fill_interrupt_transfer, libusb_fill_iso_transfer, libusb_free_transfer,
+    libusb_iso_packet_descriptor, libusb_transfer,
 };
 use std::ops::{Deref, DerefMut};
 use std::pin::pin;
@@ -21,12 +21,67 @@ use std::time::Duration;
 use std::{ffi::c_void, marker::PhantomData, ptr::NonNull};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
+use usb::{libusb_cancel_transfer, libusb_submit_transfer};
 
 #[cfg(feature = "zerocopy")]
 use zerocopy_derive::*;
 
-pub use dma::{AllocError, DeviceHandleExt, UsbMemMut};
+pub use dma::{AllocError, DeviceHandleExt};
+pub use usb::UsbMemMut;
 
+mod usb {
+    #[cfg(not(test))]
+    pub use crate::dma::UsbMemMut;
+    #[cfg(not(test))]
+    pub use rusb::{
+        ffi::{libusb_cancel_transfer, libusb_submit_transfer},
+        DeviceHandle,
+    };
+    #[cfg(test)]
+    pub use tb::{libusb_cancel_transfer, libusb_submit_transfer, DeviceHandle, UsbMemMut};
+
+    #[cfg(test)]
+    mod tb {
+        use std::{ffi::c_int, marker::PhantomData};
+
+        use rusb::ffi;
+
+        use crate::transfer_callback;
+
+        pub use bytes::BytesMut as UsbMemMut;
+
+        #[derive(Debug, Default)]
+        pub struct DeviceHandle<T: rusb::UsbContext> {
+            _p: PhantomData<T>,
+        }
+
+        impl<T: rusb::UsbContext> DeviceHandle<T> {
+            pub fn as_raw(&self) -> *mut ffi::libusb_device_handle {
+                std::ptr::NonNull::dangling().as_ptr()
+            }
+
+            pub fn new() -> Self {
+                Self { _p: PhantomData }
+            }
+        }
+
+        pub unsafe fn libusb_cancel_transfer(transfer: *mut ffi::libusb_transfer) -> c_int {
+            let t = transfer.as_mut().unwrap();
+            t.status = rusb::constants::LIBUSB_TRANSFER_CANCELLED;
+            t.actual_length = 0;
+            transfer_callback(transfer);
+            0
+        }
+
+        pub unsafe fn libusb_submit_transfer(transfer: *mut ffi::libusb_transfer) -> c_int {
+            let t = transfer.as_mut().unwrap();
+            t.status = 0;
+            t.actual_length = t.length;
+            transfer_callback(transfer);
+            0
+        }
+    }
+}
 mod dma;
 
 #[derive(Debug)]
@@ -315,7 +370,7 @@ impl InnerTransfer {
     /// as a `*mut MaybeUninit<u8>`.
     pub unsafe fn into_int<C: rusb::UsbContext>(
         self,
-        dev_handle: &rusb::DeviceHandle<C>,
+        dev_handle: &usb::DeviceHandle<C>,
         endpoint: u8,
         buf: UsbMemMut,
     ) -> Transfer<C> {
@@ -572,6 +627,7 @@ impl<C: rusb::UsbContext> std::future::Future for TransferFuture<'_, C> {
                 }
 
                 self.state = SubmitState::InFlight;
+                cx.waker().wake_by_ref();
                 Poll::Pending
             }
             SubmitState::InFlight => {
@@ -591,6 +647,7 @@ impl<C: rusb::UsbContext> std::future::Future for TransferFuture<'_, C> {
                     }
                     Event::Completed => SubmitState::Completed,
                 };
+                cx.waker().wake_by_ref();
                 Poll::Pending
             }
             SubmitState::Cancelled => {
@@ -598,6 +655,7 @@ impl<C: rusb::UsbContext> std::future::Future for TransferFuture<'_, C> {
                 let notify = self.transfer.state.as_ref().map(|s| &s.notify).unwrap();
                 ready!(pin!(notify.notified()).poll(cx));
                 self.state = SubmitState::Completed;
+                cx.waker().wake_by_ref();
                 Poll::Pending
             }
             SubmitState::Completed => {
@@ -728,11 +786,6 @@ impl<C: rusb::UsbContext> Transfer<C> {
 
     fn inner_mut(&mut self) -> &mut InnerTransfer {
         self.inner.as_mut().unwrap()
-    }
-
-    #[inline]
-    async fn notified(&self) {
-        self.state.as_ref().unwrap().notify.notified().await
     }
 
     #[inline]
@@ -979,5 +1032,28 @@ pub(crate) fn from_libusb(err: i32) -> rusb::Error {
 
 #[cfg(test)]
 mod tests {
+    use crate::usb::DeviceHandle;
+
     use super::*;
+
+    #[tokio::test]
+    async fn submit_completes() {
+        let handle: DeviceHandle<rusb::Context> = DeviceHandle::new();
+        let buf = UsbMemMut::with_capacity(64);
+        let inner_transfer = InnerTransfer::new(0);
+
+        let mut transfer = unsafe { inner_transfer.into_int(&handle, 0, buf) };
+        let cancel = CancellationToken::new();
+
+        let result = tokio::select! {
+            result = unsafe { transfer.submit(&cancel) } => {
+                result
+            },
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                panic!("transfer never completed")
+            }
+        };
+
+        assert_eq!(result, Ok(TransferStatus::Completed));
+    }
 }

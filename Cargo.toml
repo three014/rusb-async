@@ -16,4 +16,4 @@ zerocopy-derive = { version = "0.8.14", optional = true }
 zerocopy = ["dep:zerocopy", "dep:zerocopy-derive"]
 
 [dev-dependencies]
-tokio = { version = "1.43.0", default-features = false, features = ["rt-multi-thread"] }
+tokio = { version = "1.43.0", default-features = false, features = ["rt-multi-thread", "time"] }
