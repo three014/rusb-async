@@ -66,7 +66,7 @@ fn main() {
     rt.block_on(async move {
         println!("about to run transfer");
         // SAFETY: We run this transfer to its completion.
-        let result = unsafe { transfer.submit(cancel_transfer2) }.await;
+        let result = unsafe { transfer.submit(&cancel_transfer2) }.await;
         println!("{result:?}");
         if result.is_ok() {
             println!("{:?}", transfer.into_buf().unwrap());

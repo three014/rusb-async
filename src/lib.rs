@@ -14,7 +14,9 @@ use rusb::ffi::{
     libusb_free_transfer, libusb_iso_packet_descriptor, libusb_submit_transfer, libusb_transfer,
 };
 use std::ops::{Deref, DerefMut};
+use std::pin::pin;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::task::{ready, Poll};
 use std::time::Duration;
 use std::{ffi::c_void, marker::PhantomData, ptr::NonNull};
 use tokio::sync::Notify;
@@ -501,10 +503,123 @@ fn make_user_data(mut buf: UsbMemMut) -> (*mut u8, i32, Arc<UserData>) {
     (ptr, len, user_data)
 }
 
-pub struct TransferFuture<'a> {
-    state: &'a Mutex<State>,
-    notify: &'a Notify,
-    cancel: CancellationToken,
+#[derive(Debug)]
+pub struct TransferFuture<'a, C: rusb::UsbContext> {
+    transfer: &'a mut Transfer<C>,
+    cancel: &'a CancellationToken,
+    state: SubmitState,
+}
+
+#[derive(Debug)]
+enum SubmitState {
+    Init,
+    InFlight,
+    Cancelled,
+    Completed,
+}
+
+impl<'a, C: rusb::UsbContext> TransferFuture<'a, C> {
+    const fn new(transfer: &'a mut Transfer<C>, cancel: &'a CancellationToken) -> Self {
+        Self {
+            transfer,
+            cancel,
+            state: SubmitState::Init,
+        }
+    }
+}
+
+impl<C: rusb::UsbContext> std::future::Future for TransferFuture<'_, C> {
+    type Output = Result<TransferStatus, rusb::Error>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Self::Output> {
+        enum Event {
+            Cancelled,
+            Completed,
+        }
+
+        #[inline]
+        async fn select(notify: &Notify, cancel: &CancellationToken) -> Event {
+            tokio::select! {
+                biased;
+                _ = notify.notified() => Event::Completed,
+                _ = cancel.cancelled() => Event::Cancelled,
+            }
+        }
+
+        match self.state {
+            SubmitState::Init => {
+                // Submit was just called and we just started polling this transfer,
+                // so we need to check that this transfer wasn't previously submitted.
+                // Otherwise, we submit the transfer and transition to SubmitState::InFlight.
+                if State::Ready == self.transfer.state() {
+                    self.state = SubmitState::Completed;
+                    return Poll::Pending;
+                }
+
+                // SAFETY: Creator of this transfer upholds safety contract.
+                match unsafe { self.transfer.inner_submit() } {
+                    Ok(_) => {
+                        let mut state = self.transfer.state_mut();
+                        if State::Ready != *state {
+                            *state = State::Running;
+                        }
+                    }
+                    Err(rusb::Error::Busy) => (),
+                    Err(err) => return Poll::Ready(Err(err)),
+                }
+
+                self.state = SubmitState::InFlight;
+                Poll::Pending
+            }
+            SubmitState::InFlight => {
+                // The transfer is active so we need to poll for both the completion
+                // notification and a cancellation. If we get a cancel, then we transition
+                // to SubmitState::Cancelled and poll for the completion, otherwise we go to
+                // SubmitState::Completed.
+                let event = {
+                    let notify = self.transfer.state.as_ref().map(|s| &s.notify).unwrap();
+                    let fut = select(notify, &self.cancel);
+                    ready!(pin!(fut).poll(cx))
+                };
+                self.state = match event {
+                    Event::Cancelled => {
+                        _ = self.transfer.cancel();
+                        SubmitState::Cancelled
+                    }
+                    Event::Completed => SubmitState::Completed,
+                };
+                Poll::Pending
+            }
+            SubmitState::Cancelled => {
+                // All we need to do here is just wait for the completion.
+                let notify = self.transfer.state.as_ref().map(|s| &s.notify).unwrap();
+                ready!(pin!(notify.notified()).poll(cx));
+                self.state = SubmitState::Completed;
+                Poll::Pending
+            }
+            SubmitState::Completed => {
+                // SAFETY: The transfer is done, we're free to access the data!
+                unsafe {
+                    // Calculate new buffer length from transfer
+                    let transfer_ref = self.transfer.inner().as_ref();
+                    let mut transfer_len = transfer_ref.actual_length as usize;
+                    if LIBUSB_TRANSFER_TYPE_CONTROL == transfer_ref.transfer_type {
+                        transfer_len += size_of::<ControlPacket>();
+                    }
+
+                    let status = TransferStatus::from_i32(transfer_ref.status).unwrap();
+
+                    // Update UsbMemMut with the new buffer length
+                    self.transfer.bytes_mut().unwrap().set_len(transfer_len);
+
+                    Poll::Ready(Ok(status))
+                }
+            }
+        }
+    }
 }
 
 struct BorrowedBytesMut<'a, C: rusb::UsbContext> {
@@ -679,62 +794,11 @@ impl<C: rusb::UsbContext> Transfer<C> {
     /// 3. If the transfer is not complete and the function can't access the tokio runtime,
     ///    then the function panics. (TODO: Not a great alternative)
     #[must_use = "futures do nothing unless polled"]
-    pub async unsafe fn submit(
-        &mut self,
-        cancel_token: CancellationToken,
-    ) -> Result<TransferStatus, rusb::Error> {
-        if State::Ready == self.state() {
-            // SAFETY: Transfer is ready, therefore libusb is no longer mutating `status`
-            let status = TransferStatus::from_i32(unsafe { self.inner().as_ref().status }).unwrap();
-            return Ok(status);
-        }
-
-        // SAFETY: We hold exclusive mutable access to `self`.
-        //         Therefore, we can prevent anyone else from
-        //         accessing the UsbMemMut and the inner transfer
-        //         while libusb uses the data.
-        match unsafe { self.inner_submit() } {
-            Ok(_) => {
-                let mut state = self.state_mut();
-                if State::Ready != *state {
-                    *state = State::Running;
-                }
-            }
-            Err(rusb::Error::Busy) => (),
-            Err(err) => return Err(err),
-        }
-
-        enum Event {
-            Cancelled,
-            Completed,
-        }
-
-        if let Event::Cancelled = tokio::select! {
-            biased;
-            _ = self.notified() => Event::Completed,
-            _ = cancel_token.cancelled() => Event::Cancelled,
-        } {
-            _ = self.cancel();
-            self.notified().await;
-        };
-
-        // SAFETY: libusb has completed the transfer and is no
-        //         longer using the transfer struct, making it
-        //         safe for us to use.
-        unsafe {
-            // Update UsbMemMut with the new buffer length from transfer
-            let transfer_ref = self.inner().as_ref();
-            let mut transfer_len = transfer_ref.actual_length as usize;
-            if LIBUSB_TRANSFER_TYPE_CONTROL == transfer_ref.transfer_type {
-                transfer_len += size_of::<ControlPacket>();
-            }
-            // Get status from transfer
-            let status = TransferStatus::from_i32(transfer_ref.status).unwrap();
-
-            self.bytes_mut().unwrap().set_len(transfer_len);
-
-            Ok(status)
-        }
+    pub unsafe fn submit<'a>(
+        &'a mut self,
+        cancel_token: &'a CancellationToken,
+    ) -> TransferFuture<'a, C> {
+        TransferFuture::new(self, cancel_token)
     }
 
     /// # Safety
