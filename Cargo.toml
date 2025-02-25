@@ -1,6 +1,6 @@
 [package]
 name = "rusb_async"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2021"
 
 [dependencies]
@@ -9,8 +9,11 @@ bytes = "1.9.0"
 rusb = { git = "https://github.com/three014/rusb.git", version = "0.9.4" }
 tokio = { version = "1.43.0", default-features = false, features = ["rt", "sync", "macros"] }
 tokio-util = { version = "0.7.13", default-features = false }
-zerocopy = "0.8.14"
-zerocopy-derive = "0.8.14"
+zerocopy = { version = "0.8.14", optional = true }
+zerocopy-derive = { version = "0.8.14", optional = true }
+
+[features]
+zerocopy = ["dep:zerocopy", "dep:zerocopy-derive"]
 
 [dev-dependencies]
 tokio = { version = "1.43.0", default-features = false, features = ["rt-multi-thread"] }
