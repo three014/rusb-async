@@ -104,7 +104,10 @@ pub enum State {
     Ready,
 }
 
-#[cfg_attr(feature = "zerocopy", derive(IntoBytes, FromBytes, Immutable, KnownLayout))]
+#[cfg_attr(
+    feature = "zerocopy",
+    derive(IntoBytes, FromBytes, Immutable, KnownLayout)
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub struct ControlPacket {
@@ -115,7 +118,10 @@ pub struct ControlPacket {
     pub w_length: u16,
 }
 
-#[cfg_attr(feature = "zerocopy", derive(IntoBytes, FromZeros, Immutable, KnownLayout))]
+#[cfg_attr(
+    feature = "zerocopy",
+    derive(IntoBytes, FromZeros, Immutable, KnownLayout)
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum TransferStatus {
@@ -217,14 +223,14 @@ impl InnerTransfer {
     /// If `user_data` is set, then this function drops
     /// the data. Currently `user_data` is an `Arc<UserData>`,
     /// so this function decrements the reference count.
-    /// 
+    ///
     /// # Safety
     ///
     /// It is undefined behavior to call this function during
     /// an active transfer as the libusb runtime could access
     /// any of this data at the same time, potentially on another
     /// thread.
-    /// 
+    ///
     /// Additionally, caller must not call this function if `self`
     /// is part of a [`Transfer`] struct at all, as submitting
     /// a transfer to libusb could do bad things if `self` had
@@ -584,7 +590,7 @@ impl<C: rusb::UsbContext> Transfer<C> {
     }
 
     #[inline]
-    fn do_if_idle<T, F: FnOnce(&Self) -> T>(&self, f: F) -> Option<T> {
+    fn do_if_idle<T>(&self, f: impl FnOnce(&Self) -> T) -> Option<T> {
         if State::Running == self.state() {
             None
         } else {
@@ -593,7 +599,7 @@ impl<C: rusb::UsbContext> Transfer<C> {
     }
 
     #[inline]
-    fn do_if_idle_mut<'a, T, F: FnOnce(&'a mut Self) -> T>(&'a mut self, f: F) -> Option<T> {
+    fn do_if_idle_mut<'a, T>(&'a mut self, f: impl FnOnce(&'a mut Self) -> T) -> Option<T> {
         if State::Running == self.state() {
             None
         } else {
@@ -825,16 +831,16 @@ impl<C: rusb::UsbContext> Transfer<C> {
 
     pub fn into_parts(mut self) -> Option<(InnerTransfer, UsbMemMut)> {
         self.do_if_idle_mut(|this| {
+            let mut inner = this.inner.take().unwrap();
+            // SAFETY: Inner transfer is no longer owned by `Transfer`.
+            unsafe { inner.clear() };
+
             let buf = this
                 .state
                 .take()
                 .and_then(|s| Arc::into_inner(s))
                 .map(|u| u.buf)
                 .unwrap();
-            let mut inner = this.inner.take().unwrap();
-
-            // SAFETY: Inner transfer is no longer owned by `Transfer`.
-            unsafe { inner.clear() };
             (inner, buf)
         })
     }
@@ -842,7 +848,11 @@ impl<C: rusb::UsbContext> Transfer<C> {
 
 impl<C: rusb::UsbContext> Drop for Transfer<C> {
     fn drop(&mut self) {
-        if State::Running == self.state() {
+        if self
+            .state
+            .as_ref()
+            .is_some_and(|s| State::Running == *s.state.lock().unwrap())
+        {
             _ = self.cancel();
             let handle = tokio::runtime::Handle::current();
             let user_data = self.state.take().unwrap();
