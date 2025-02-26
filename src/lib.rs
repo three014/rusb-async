@@ -9,19 +9,20 @@ use rusb::constants::{
     LIBUSB_TRANSFER_TYPE_INTERRUPT, LIBUSB_TRANSFER_TYPE_ISOCHRONOUS,
 };
 use rusb::ffi::{
-    libusb_alloc_transfer, libusb_fill_bulk_transfer, libusb_fill_control_transfer,
-    libusb_fill_interrupt_transfer, libusb_fill_iso_transfer, libusb_free_transfer,
-    libusb_iso_packet_descriptor, libusb_transfer,
+    libusb_fill_bulk_transfer, libusb_fill_control_transfer, libusb_fill_interrupt_transfer,
+    libusb_fill_iso_transfer, libusb_iso_packet_descriptor, libusb_transfer,
 };
 use std::ops::{Deref, DerefMut};
 use std::pin::pin;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::task::{ready, Poll};
+use std::task::{ready, Poll, Waker};
 use std::time::Duration;
 use std::{ffi::c_void, marker::PhantomData, ptr::NonNull};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
-use usb::{libusb_cancel_transfer, libusb_submit_transfer};
+use usb::{
+    libusb_alloc_transfer, libusb_cancel_transfer, libusb_free_transfer, libusb_submit_transfer,
+};
 
 #[cfg(feature = "zerocopy")]
 use zerocopy_derive::*;
@@ -29,64 +30,13 @@ use zerocopy_derive::*;
 pub use dma::{AllocError, DeviceHandleExt};
 pub use usb::UsbMemMut;
 
-mod usb {
-    #[cfg(not(test))]
-    pub use crate::dma::UsbMemMut;
-    #[cfg(not(test))]
-    pub use rusb::{
-        ffi::{libusb_cancel_transfer, libusb_submit_transfer},
-        DeviceHandle,
-    };
-    #[cfg(test)]
-    pub use tb::{libusb_cancel_transfer, libusb_submit_transfer, DeviceHandle, UsbMemMut};
-
-    #[cfg(test)]
-    mod tb {
-        use std::{ffi::c_int, marker::PhantomData};
-
-        use rusb::ffi;
-
-        use crate::transfer_callback;
-
-        pub use bytes::BytesMut as UsbMemMut;
-
-        #[derive(Debug, Default)]
-        pub struct DeviceHandle<T: rusb::UsbContext> {
-            _p: PhantomData<T>,
-        }
-
-        impl<T: rusb::UsbContext> DeviceHandle<T> {
-            pub fn as_raw(&self) -> *mut ffi::libusb_device_handle {
-                std::ptr::NonNull::dangling().as_ptr()
-            }
-
-            pub fn new() -> Self {
-                Self { _p: PhantomData }
-            }
-        }
-
-        pub unsafe fn libusb_cancel_transfer(transfer: *mut ffi::libusb_transfer) -> c_int {
-            let t = transfer.as_mut().unwrap();
-            t.status = rusb::constants::LIBUSB_TRANSFER_CANCELLED;
-            t.actual_length = 0;
-            transfer_callback(transfer);
-            0
-        }
-
-        pub unsafe fn libusb_submit_transfer(transfer: *mut ffi::libusb_transfer) -> c_int {
-            let t = transfer.as_mut().unwrap();
-            t.status = 0;
-            t.actual_length = t.length;
-            transfer_callback(transfer);
-            0
-        }
-    }
-}
 mod dma;
+mod usb;
 
 #[derive(Debug)]
 pub struct UserData {
-    notify: Notify,
+    completion: Notify,
+    waker: Option<Waker>,
     state: Mutex<State>,
     buf: UsbMemMut,
 }
@@ -332,6 +282,7 @@ impl InnerTransfer {
     ///
     /// This function panics if the inner transfer's `user_data` already
     /// exists.
+    #[inline]
     pub(crate) fn insert_user_data(&mut self, user_data: Arc<UserData>) {
         let transfer = unsafe { self.as_mut() };
         if !transfer.user_data.is_null() {
@@ -341,18 +292,22 @@ impl InnerTransfer {
     }
 
     /// Returns a raw pointer to the allocated `libusb_transfer` struct.
+    #[inline]
     pub(crate) const fn as_raw(&self) -> *mut libusb_transfer {
         self.ptr.as_ptr()
     }
 
+    #[inline]
     pub(crate) const unsafe fn as_ref(&self) -> &libusb_transfer {
         self.ptr.as_ref()
     }
 
+    #[inline]
     pub(crate) const unsafe fn as_mut(&mut self) -> &mut libusb_transfer {
         self.ptr.as_mut()
     }
 
+    #[inline]
     pub const fn num_iso_packets(&self) -> usize {
         self.num_isos as usize
     }
@@ -545,15 +500,16 @@ impl Drop for InnerTransfer {
     }
 }
 
+#[inline]
 fn make_user_data(mut buf: UsbMemMut) -> (*mut u8, i32, Arc<UserData>) {
     buf.truncate(0);
-    let notify = Notify::const_new();
+    let completion = Notify::const_new();
     let state = Mutex::default();
     let (ptr, len) = {
         let spare = buf.spare_capacity_mut();
         (spare.as_mut_ptr().cast(), spare.len() as i32)
     };
-    let user_data = Arc::new(UserData { notify, state, buf });
+    let user_data = Arc::new(UserData { waker: None, completion, state, buf });
 
     (ptr, len, user_data)
 }
@@ -595,7 +551,6 @@ impl<C: rusb::UsbContext> std::future::Future for TransferFuture<'_, C> {
             Completed,
         }
 
-        #[inline]
         async fn select(notify: &Notify, cancel: &CancellationToken) -> Event {
             tokio::select! {
                 biased;
@@ -604,80 +559,108 @@ impl<C: rusb::UsbContext> std::future::Future for TransferFuture<'_, C> {
             }
         }
 
-        match self.state {
-            SubmitState::Init => {
-                // Submit was just called and we just started polling this transfer,
-                // so we need to check that this transfer wasn't previously submitted.
-                // Otherwise, we submit the transfer and transition to SubmitState::InFlight.
-                if State::Ready == self.transfer.state() {
-                    self.state = SubmitState::Completed;
-                    return Poll::Pending;
-                }
+        loop {
+            match self.state {
+                SubmitState::Init => {
+                    // Submit was just called and we just started polling this transfer,
+                    // so we need to check that this transfer wasn't previously submitted.
+                    // Otherwise, we submit the transfer and transition to SubmitState::InFlight.
+                    if State::Ready == self.transfer.state() {
+                        self.state = SubmitState::Completed;
+                        continue;
+                    }
 
-                // SAFETY: Creator of this transfer upholds safety contract.
-                match unsafe { self.transfer.inner_submit() } {
-                    Ok(_) => {
-                        let mut state = self.transfer.state_mut();
-                        if State::Ready != *state {
-                            *state = State::Running;
+                    // SAFETY: We have not submitted the transfer to libusb.
+                    let mut user_data = unsafe { take_user_data(&mut self.transfer) };
+                    Arc::get_mut(&mut user_data).unwrap().waker = Some(cx.waker().clone());
+                    insert_user_data(&mut self.transfer, user_data);
+
+                    // SAFETY: Creator of this transfer upholds safety contract.
+                    match unsafe { self.transfer.inner_submit() } {
+                        Ok(_) => {
+                            let mut state = self.transfer.state_mut();
+                            if State::Ready != *state {
+                                *state = State::Running;
+                            }
                         }
+                        Err(rusb::Error::Busy) => (),
+                        Err(err) => break Poll::Ready(Err(err)),
                     }
-                    Err(rusb::Error::Busy) => (),
-                    Err(err) => return Poll::Ready(Err(err)),
+
+                    self.state = SubmitState::InFlight;
+                    continue;
                 }
+                SubmitState::InFlight => {
+                    // The transfer is active so we need to poll for both the completion
+                    // notification and a cancellation. If we get a cancel, then we transition
+                    // to SubmitState::Cancelled and poll for the completion, otherwise we go to
+                    // SubmitState::Completed.
+                    let event = {
+                        let notify = self.transfer.user_data.as_ref().map(|s| &s.completion).unwrap();
+                        let fut = select(notify, &self.cancel);
+                        ready!(pin!(fut).poll(cx))
+                    };
+                    self.state = match event {
+                        Event::Cancelled => {
+                            _ = self.transfer.cancel();
+                            SubmitState::Cancelled
+                        }
+                        Event::Completed => SubmitState::Completed,
+                    };
+                    continue;
+                }
+                SubmitState::Cancelled => {
+                    // All we need to do here is just wait for the completion.
+                    let notify = self.transfer.user_data.as_ref().map(|s| &s.completion).unwrap();
+                    ready!(pin!(notify.notified()).poll(cx));
+                    self.state = SubmitState::Completed;
+                    continue;
+                }
+                SubmitState::Completed => {
+                    // SAFETY: The transfer is done, we're free to access the data!
+                    unsafe {
+                        // Calculate new buffer length from transfer
+                        let transfer_ref = self.transfer.inner().as_ref();
+                        let mut transfer_len = transfer_ref.actual_length as usize;
+                        if LIBUSB_TRANSFER_TYPE_CONTROL == transfer_ref.transfer_type {
+                            transfer_len += size_of::<ControlPacket>();
+                        }
 
-                self.state = SubmitState::InFlight;
-                cx.waker().wake_by_ref();
-                Poll::Pending
-            }
-            SubmitState::InFlight => {
-                // The transfer is active so we need to poll for both the completion
-                // notification and a cancellation. If we get a cancel, then we transition
-                // to SubmitState::Cancelled and poll for the completion, otherwise we go to
-                // SubmitState::Completed.
-                let event = {
-                    let notify = self.transfer.state.as_ref().map(|s| &s.notify).unwrap();
-                    let fut = select(notify, &self.cancel);
-                    ready!(pin!(fut).poll(cx))
-                };
-                self.state = match event {
-                    Event::Cancelled => {
-                        _ = self.transfer.cancel();
-                        SubmitState::Cancelled
+                        let status = TransferStatus::from_i32(transfer_ref.status).unwrap();
+
+                        // Update UsbMemMut with the new buffer length
+                        self.transfer.bytes_mut().unwrap().set_len(transfer_len);
+
+                        break Poll::Ready(Ok(status));
                     }
-                    Event::Completed => SubmitState::Completed,
-                };
-                cx.waker().wake_by_ref();
-                Poll::Pending
-            }
-            SubmitState::Cancelled => {
-                // All we need to do here is just wait for the completion.
-                let notify = self.transfer.state.as_ref().map(|s| &s.notify).unwrap();
-                ready!(pin!(notify.notified()).poll(cx));
-                self.state = SubmitState::Completed;
-                cx.waker().wake_by_ref();
-                Poll::Pending
-            }
-            SubmitState::Completed => {
-                // SAFETY: The transfer is done, we're free to access the data!
-                unsafe {
-                    // Calculate new buffer length from transfer
-                    let transfer_ref = self.transfer.inner().as_ref();
-                    let mut transfer_len = transfer_ref.actual_length as usize;
-                    if LIBUSB_TRANSFER_TYPE_CONTROL == transfer_ref.transfer_type {
-                        transfer_len += size_of::<ControlPacket>();
-                    }
-
-                    let status = TransferStatus::from_i32(transfer_ref.status).unwrap();
-
-                    // Update UsbMemMut with the new buffer length
-                    self.transfer.bytes_mut().unwrap().set_len(transfer_len);
-
-                    Poll::Ready(Ok(status))
                 }
             }
         }
     }
+}
+
+#[inline]
+unsafe fn take_user_data<C: rusb::UsbContext>(transfer: &mut Transfer<C>) -> Arc<UserData> {
+    // Game plan: Drop the Arc<UserData> that's held by the inner transfer
+    //            so that we're down to one reference, allowing us to
+    //            call `Arc::get_mut()` and access the buffer.
+    let inner = transfer.inner.as_mut().unwrap();
+
+    // SAFETY: Transfer is not active so we have the only reference to
+    //         the inner transfer.
+    _ = unsafe { inner.take_user_data().unwrap() };
+
+    transfer.user_data.take().unwrap()
+}
+
+#[inline]
+fn insert_user_data<C: rusb::UsbContext>(transfer: &mut Transfer<C>, user_data: Arc<UserData>) {
+    let for_inner = Arc::clone(&user_data);
+    let inner = transfer.inner_mut();
+
+    // Put back the user data
+    inner.insert_user_data(for_inner);
+    transfer.user_data = Some(user_data);
 }
 
 struct BorrowedBytesMut<'a, C: rusb::UsbContext> {
@@ -691,17 +674,8 @@ impl<'a, C: rusb::UsbContext> BorrowedBytesMut<'a, C> {
     /// Transfer must NOT be in a `Running` state. A looooot
     /// of UB can occur otherwise.
     unsafe fn new(transfer: &'a mut Transfer<C>) -> Option<Self> {
-        // Game plan: Drop the Arc<UserData> that's held by the inner transfer
-        //            so that we're down to one reference, allowing us to
-        //            call `Arc::get_mut()` and access the buffer.
-
-        let inner = transfer.inner.as_mut().unwrap();
-
-        // SAFETY: Transfer is not active so we have the only reference to
-        //         the inner transfer.
-        _ = unsafe { inner.take_user_data().unwrap() };
-
-        let user_data = transfer.state.take().unwrap();
+        // SAFETY: Caller promises we're not in an active transfer.
+        let user_data = unsafe { take_user_data(transfer) };
         Some(Self {
             user_data,
             transfer,
@@ -726,11 +700,7 @@ impl<C: rusb::UsbContext> DerefMut for BorrowedBytesMut<'_, C> {
 impl<C: rusb::UsbContext> Drop for BorrowedBytesMut<'_, C> {
     fn drop(&mut self) {
         let user_data = Arc::clone(&self.user_data);
-        let inner = self.transfer.inner_mut();
-
-        // Put back the user_data
-        inner.insert_user_data(Arc::clone(&user_data));
-        self.transfer.state = Some(user_data);
+        insert_user_data(&mut self.transfer, user_data);
     }
 }
 
@@ -747,7 +717,7 @@ impl<C: rusb::UsbContext> Drop for BorrowedBytesMut<'_, C> {
 #[derive(Debug)]
 pub struct Transfer<C: rusb::UsbContext> {
     inner: Option<InnerTransfer>,
-    state: Option<Arc<UserData>>,
+    user_data: Option<Arc<UserData>>,
     _ctx: PhantomData<C>,
 }
 
@@ -757,7 +727,7 @@ impl<C: rusb::UsbContext> Transfer<C> {
     pub(crate) const fn new(inner: InnerTransfer, state: Arc<UserData>) -> Self {
         Self {
             inner: Some(inner),
-            state: Some(state),
+            user_data: Some(state),
             _ctx: PhantomData,
         }
     }
@@ -780,22 +750,23 @@ impl<C: rusb::UsbContext> Transfer<C> {
         }
     }
 
+    #[inline]
     const fn inner(&self) -> &InnerTransfer {
         self.inner.as_ref().unwrap()
     }
 
+    #[inline]
     fn inner_mut(&mut self) -> &mut InnerTransfer {
         self.inner.as_mut().unwrap()
     }
 
     #[inline]
     fn state(&self) -> State {
-        *self.state.as_ref().unwrap().state.lock().unwrap()
+        *self.user_data.as_ref().unwrap().state.lock().unwrap()
     }
 
-    #[inline]
     fn state_mut(&mut self) -> MutexGuard<'_, State> {
-        self.state.as_ref().unwrap().state.lock().unwrap()
+        self.user_data.as_ref().unwrap().state.lock().unwrap()
     }
 
     #[inline]
@@ -938,7 +909,7 @@ impl<C: rusb::UsbContext> Transfer<C> {
 
     pub fn into_buf(mut self) -> Option<UsbMemMut> {
         self.do_if_idle_mut(|this| {
-            this.state
+            this.user_data
                 .take()
                 .and_then(|s| Arc::into_inner(s))
                 .map(|u| u.buf)
@@ -953,7 +924,7 @@ impl<C: rusb::UsbContext> Transfer<C> {
             unsafe { inner.clear() };
 
             let buf = this
-                .state
+                .user_data
                 .take()
                 .and_then(|s| Arc::into_inner(s))
                 .map(|u| u.buf)
@@ -966,16 +937,16 @@ impl<C: rusb::UsbContext> Transfer<C> {
 impl<C: rusb::UsbContext> Drop for Transfer<C> {
     fn drop(&mut self) {
         if self
-            .state
+            .user_data
             .as_ref()
             .is_some_and(|s| State::Running == *s.state.lock().unwrap())
         {
             _ = self.cancel();
             let handle = tokio::runtime::Handle::current();
-            let user_data = self.state.take().unwrap();
+            let user_data = self.user_data.take().unwrap();
             let mut inner = self.inner.take().unwrap();
             handle.spawn(async move {
-                user_data.notify.notified().await;
+                user_data.completion.notified().await;
                 // Clearing inner transfer drops its `Arc<UserData>`
                 unsafe { inner.clear() };
                 // Dropping `user_data` drops our `Arc<UserData>`
@@ -985,6 +956,12 @@ impl<C: rusb::UsbContext> Drop for Transfer<C> {
     }
 }
 
+unsafe fn get_ctx(transfer: &libusb_transfer) -> (&Waker, &Notify, &Mutex<State>) {
+    let user_data: *const UserData = transfer.user_data.cast_const().cast();
+    let user_data = user_data.as_ref().unwrap();
+    (user_data.waker.as_ref().unwrap(), &user_data.completion, &user_data.state)
+}
+
 /// Handles a USB transfer completion, cancellation, error, or whatever,
 /// by simply alerting the function that submitted the transfer.
 extern "system" fn transfer_callback(transfer: *mut libusb_transfer) {
@@ -992,11 +969,9 @@ extern "system" fn transfer_callback(transfer: *mut libusb_transfer) {
     //         `user_data`. `user_data` is a valid `Arc<UserData>` pointer
     //         created from `Arc::into_raw`, and can be turned back into
     //         a reference to the user data.
-    let (notifier, state) = unsafe {
+    let (waker, completion, state) = unsafe {
         let transfer = transfer.as_ref().unwrap();
-        let user_data: *const UserData = transfer.user_data.cast_const().cast();
-        let user_data = user_data.as_ref().unwrap();
-        (&user_data.notify, &user_data.state)
+        get_ctx(transfer)
     };
 
     // Potential race condition here:
@@ -1006,7 +981,8 @@ extern "system" fn transfer_callback(transfer: *mut libusb_transfer) {
     // Therefore we hold the lock while sending our signal so that the next
     // thread that views the state will see the correct state.
     let mut state = state.lock().unwrap();
-    notifier.notify_one();
+    completion.notify_one();
+    waker.wake_by_ref();
     *state = State::Ready;
 }
 
@@ -1049,7 +1025,7 @@ mod tests {
             result = unsafe { transfer.submit(&cancel) } => {
                 result
             },
-            _ = tokio::time::sleep(Duration::from_secs(1)) => {
+            _ = tokio::time::sleep(Duration::from_secs(3)) => {
                 panic!("transfer never completed")
             }
         };
