@@ -15,11 +15,11 @@ pub use tb::{
 
 #[cfg(test)]
 mod tb {
-    use std::{ffi::c_int, marker::PhantomData, sync::Arc};
+    use std::{ffi::c_int, marker::PhantomData, sync::Arc, time::Duration};
 
     use rusb::ffi;
 
-    use crate::{dummy_callback, State, UserData};
+    use crate::{dummy_callback, LibusbState, UserData};
 
     pub use bytes::BytesMut as UsbMemMut;
 
@@ -39,6 +39,7 @@ mod tb {
     }
 
     pub unsafe fn libusb_alloc_transfer(_iso_packets: c_int) -> *mut ffi::libusb_transfer {
+        assert_eq!(_iso_packets, 0, "Can't allocate dynamic slices like that for testing, sorry");
         Box::into_raw(Box::new(ffi::libusb_transfer {
             dev_handle: std::ptr::null_mut(),
             flags: 0,
@@ -76,10 +77,11 @@ mod tb {
         let task_user_data = Arc::clone(&transfer_user_data);
         _ = Arc::into_raw(transfer_user_data);
         tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(745)).await;
             let mut state = task_user_data.state.lock().unwrap();
             task_user_data.completion.notify_one();
-            task_user_data.waker.as_ref().unwrap().wake_by_ref();
-            *state = State::Ready;
+            *state = LibusbState::Ready;
+            drop(state);
         });
         0
     }
