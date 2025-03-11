@@ -1,20 +1,23 @@
 [package]
 name = "rusb_async"
-version = "0.3.6"
-edition = "2021"
+version = "0.3.7"
+edition = "2024"
 
 [dependencies]
 bitflags = "2.8.0"
 bytes = "1.9.0"
-pin-project = "1.1.9"
+compio-runtime = { version = "0.7.0", optional = true }
+pin-project-lite = "0.2.16"
 rusb = { git = "https://github.com/three014/rusb.git", version = "0.9.4" }
-tokio = { version = "1.43.0", default-features = false, features = ["rt", "sync", "macros"] }
+tokio = { version = "1.43.0", default-features = false, features = ["sync", "macros"] }
 tokio-util = { version = "0.7.13", default-features = false }
 zerocopy = { version = "0.8.14", optional = true }
 zerocopy-derive = { version = "0.8.14", optional = true }
 
 [features]
 zerocopy = ["dep:zerocopy", "dep:zerocopy-derive"]
+runtime-tokio = ["tokio/rt"]
+runtime-compio = ["compio-runtime/io-uring"]
 
 [dev-dependencies]
-tokio = { version = "1.43.0", default-features = false, features = ["rt-multi-thread", "time"] }
+tokio = { version = "1.43.0", default-features = false, features = ["rt", "rt-multi-thread", "time"] }

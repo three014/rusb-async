@@ -1,10 +1,10 @@
 use completion::{Completion, Event};
-use pin_project::pin_project;
+use pin_project_lite::pin_project;
 use ptr::Ptr;
 use rusb::constants::{
     LIBUSB_ERROR_ACCESS, LIBUSB_ERROR_BUSY, LIBUSB_ERROR_INTERRUPTED, LIBUSB_ERROR_INVALID_PARAM,
-    LIBUSB_ERROR_IO, LIBUSB_ERROR_NOT_FOUND, LIBUSB_ERROR_NOT_SUPPORTED, LIBUSB_ERROR_NO_DEVICE,
-    LIBUSB_ERROR_NO_MEM, LIBUSB_ERROR_OTHER, LIBUSB_ERROR_OVERFLOW, LIBUSB_ERROR_PIPE,
+    LIBUSB_ERROR_IO, LIBUSB_ERROR_NO_DEVICE, LIBUSB_ERROR_NO_MEM, LIBUSB_ERROR_NOT_FOUND,
+    LIBUSB_ERROR_NOT_SUPPORTED, LIBUSB_ERROR_OTHER, LIBUSB_ERROR_OVERFLOW, LIBUSB_ERROR_PIPE,
     LIBUSB_ERROR_TIMEOUT, LIBUSB_TRANSFER_ADD_ZERO_PACKET, LIBUSB_TRANSFER_CANCELLED,
     LIBUSB_TRANSFER_COMPLETED, LIBUSB_TRANSFER_ERROR, LIBUSB_TRANSFER_NO_DEVICE,
     LIBUSB_TRANSFER_OVERFLOW, LIBUSB_TRANSFER_SHORT_NOT_OK, LIBUSB_TRANSFER_STALL,
@@ -17,9 +17,9 @@ use rusb::ffi::{
 };
 use std::cell::UnsafeCell;
 use std::future::Future;
-use std::pin::{pin, Pin};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::task::{ready, Poll};
+use std::task::{Poll, ready};
 use std::time::Duration;
 use std::{ffi::c_void, marker::PhantomData};
 use tokio::sync::Notify;
@@ -257,7 +257,9 @@ impl InnerTransfer {
         transfer.num_iso_packets = 0;
         transfer.callback = dummy_callback;
         transfer.buffer = std::ptr::null_mut();
-        self.take_user_data();
+        // SAFETY: Caller upholds contract that we're not
+        // in a transfer.
+        unsafe { self.take_user_data() };
     }
 
     /// Takes the user data out of the `self`, leaving a null pointer
@@ -287,12 +289,12 @@ impl InnerTransfer {
 
     #[inline]
     pub(crate) const unsafe fn as_ref(&self) -> &libusb_transfer {
-        self.ptr.as_ref()
+        unsafe { self.ptr.as_ref() }
     }
 
     #[inline]
     pub(crate) const unsafe fn as_mut(&mut self) -> &mut libusb_transfer {
-        self.ptr.as_mut()
+        unsafe { self.ptr.as_mut() }
     }
 
     #[inline]
@@ -446,10 +448,13 @@ impl InnerTransfer {
         assert!(num_iso_packets <= self.num_iso_packets());
         let (ptr, len, user_data) = make_user_data(buf);
 
-        let iso_pkts = std::slice::from_raw_parts_mut(
+        // SAFETY: `num_iso_packets` contains the length of
+        // this slice of packet descriptors, and the mutable
+        // pointer comes from an owned allocation.
+        let iso_pkts = unsafe { std::slice::from_raw_parts_mut(
             self.as_mut().iso_packet_desc.as_mut_ptr(),
             self.as_mut().num_iso_packets as usize,
-        );
+        ) };
         iso_packets
             .map(|pkt| pkt.len())
             .zip(iso_pkts)
@@ -514,14 +519,16 @@ enum FutureState {
     Completed,
 }
 
-#[pin_project(project = TransferFutureProj)]
-pub struct TransferFuture<'a> {
-    #[pin]
-    completion: Completion<'a>,
-    fut_state: FutureState,
-    transfer_state: &'a Mutex<LibusbState>,
-    transfer: *mut libusb_transfer,
-    buf: &'a UnsaferCell<UsbMemMut>,
+pin_project! {
+    #[project = TransferFutureProj]
+    pub struct TransferFuture<'a> {
+        #[pin]
+        completion: Completion<'a>,
+        fut_state: FutureState,
+        transfer_state: &'a Mutex<LibusbState>,
+        transfer: *mut libusb_transfer,
+        buf: &'a UnsaferCell<UsbMemMut>,
+    }
 }
 
 impl TransferFutureProj<'_, '_> {
@@ -560,7 +567,9 @@ impl TransferFutureProj<'_, '_> {
 
     #[inline]
     unsafe fn buf(&mut self) -> &mut UsbMemMut {
-        self.buf.0.get().as_mut().unwrap()
+        // SAFETY: Caller ensures that we don't access
+        // this memory while a transfer is active.
+        unsafe { self.buf.0.get().as_mut().unwrap() }
     }
 }
 
@@ -706,10 +715,9 @@ impl<C: rusb::UsbContext> Transfer<C> {
     ///
     /// # Safety
     ///
-    /// The caller must not drop the resulting future until completion.
-    ///
-    /// Dropping future and the transfer does not immediately result in
-    /// undefined behavior. See struct definition for more info.
+    /// This function assumes that the caller upheld the contract specified
+    /// by the `into_iso`, `into_int`, `into_ctrl`, `into_bulk` functions.
+    /// Otherwise, the transfer write into uninitialized memory.
     ///
     /// # Cancel safety
     ///
@@ -722,13 +730,18 @@ impl<C: rusb::UsbContext> Transfer<C> {
     ///
     /// 1. If the transfer is complete, then all parts of the transfer are
     ///    dropped/deallocated safely.
-    /// 2. If the transfer is not complete and the function can access the tokio runtime,
+    /// 2. If the transfer is not complete and the function can access the async runtime,
     ///    then the function spawns a new future into the executor to finish polling for
     ///    the transfer callback, then drops the rest of the transfer.
-    /// 3. If the transfer is not complete and the function can't access the tokio runtime,
-    ///    then the function panics. (TODO: Not a great alternative)
+    /// 3. If the transfer is not complete and the function can't access the async runtime,
+    ///    then the function leaks the buffer and transfer to prevent the callback
+    ///    function from using freed memory.
+    ///
+    /// Scenario 3 has some implications if only using a portion of the DMA mapping, since
+    /// [`UsbMemMut`] requires a unique reference to the mapping to reclaim any part of the
+    /// allocation. TODO.
     #[must_use = "futures do nothing unless polled"]
-    pub unsafe fn submit<'a>(&'a self, cancel_token: &'a CancellationToken) -> TransferFuture<'a> {
+    pub fn submit<'a>(&'a self, cancel_token: &'a CancellationToken) -> TransferFuture<'a> {
         let transfer = self.inner().as_raw();
         let (completion, state, buf) = self.user_data.as_ref().unwrap().into_refs();
         TransferFuture {
@@ -832,20 +845,71 @@ impl<C: rusb::UsbContext> Drop for Transfer<C> {
     fn drop(&mut self) {
         if self.is_running() {
             _ = self.cancel();
-            let handle = tokio::runtime::Handle::current();
+            // We take our these blocks of data so that
+            // their destructors don't run when we drop
+            // the outer transfer.
             let user_data = self.user_data.take().unwrap();
             let inner = self.inner.take().unwrap();
-            handle.spawn(async move {
-                user_data.completion.notified().await;
-                let _goodbye = inner;
-            });
+            match default_runtime() {
+                Some(rt) => _ = rt.spawn_detached(Box::pin(async move {
+                    user_data.completion.notified().await;
+                    let _goodbye = inner;
+                })),
+                None => {
+                    // We leak the memory so that libusb nor
+                    // the USB device will write into freed
+                    // memory.
+                    _ = Arc::into_raw(user_data);
+                    std::mem::forget(inner);
+                }
+            };
         }
+    }
+}
+
+trait AsyncRuntime: Send + Sync + std::fmt::Debug + 'static {
+    fn spawn_detached(&self, fut: Pin<Box<dyn Future<Output = ()> + Send>>);
+}
+
+#[cfg(feature = "runtime-compio")]
+#[derive(Debug)]
+struct CompioRuntime;
+    
+#[cfg(feature = "runtime-compio")]
+impl AsyncRuntime for CompioRuntime {
+    fn spawn_detached(&self, fut: Pin<Box<dyn Future<Output = ()> + Send>>) {
+        compio_runtime::spawn(fut).detach();
+    }
+}
+
+fn default_runtime() -> Option<Arc<dyn AsyncRuntime>> {
+    #[cfg(feature = "runtime-tokio")]
+    {
+        return ::tokio::runtime::Handle::try_current().ok().map(|handle| Arc::new(handle) as Arc<dyn AsyncRuntime>);
+    }
+
+    #[cfg(feature = "runtime-compio")]
+    {
+        return Some(Arc::new(CompioRuntime) as Arc<dyn AsyncRuntime>)
+    }
+
+    #[cfg(not(any(feature = "runtime-tokio", feature = "runtime-compio")))]
+    None
+}
+
+#[cfg(feature = "runtime-tokio")]
+impl AsyncRuntime for tokio::runtime::Handle {
+    fn spawn_detached(&self, fut: Pin<Box<dyn Future<Output = ()> + Send>>)
+    {
+        self.spawn(fut);
     }
 }
 
 unsafe fn get_ctx(transfer: &libusb_transfer) -> &UserData {
     let user_data: *const UserData = transfer.user_data.cast_const().cast();
-    user_data.as_ref().unwrap()
+    // SAFETY: If we're not already in freed memory, then the user data
+    // should be safe to access as well.
+    unsafe { user_data.as_ref().unwrap() }
 }
 
 /// Handles a USB transfer completion, cancellation, error, or whatever,
@@ -886,6 +950,8 @@ pub(crate) fn from_libusb(err: i32) -> rusb::Error {
 
 #[cfg(test)]
 mod tests {
+    use std::pin::pin;
+
     use crate::usb::DeviceHandle;
 
     use super::*;
@@ -900,7 +966,7 @@ mod tests {
         let cancel = CancellationToken::new();
 
         let result = tokio::select! {
-            result = unsafe { transfer.submit(&cancel) } => {
+            result = transfer.submit(&cancel) => {
                 result
             },
             _ = tokio::time::sleep(Duration::from_secs(3)) => {
@@ -920,7 +986,7 @@ mod tests {
         let transfer = unsafe { inner_transfer.into_int(&handle, 0, buf) };
         let cancel = CancellationToken::new();
 
-        let mut fut = pin!(unsafe { transfer.submit(&cancel) });
+        let mut fut = pin!(transfer.submit(&cancel));
 
         let result: Option<_> = tokio::select! {
             result = &mut fut => {

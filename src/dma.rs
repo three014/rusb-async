@@ -22,16 +22,6 @@ impl std::fmt::Debug for UsbMemMut {
 
 impl UsbMemMut {
     #[inline]
-    pub(crate) fn dangling() -> Self {
-        Self {
-            ptr: NonNull::dangling(),
-            len: 0,
-            cap: 0,
-            data: None,
-        }
-    }
-    
-    #[inline]
     pub fn len(&self) -> usize {
         self.len
     }
@@ -109,7 +99,7 @@ impl UsbMemMut {
 
         debug_assert!(cnt <= self.cap, "internal: set_start out of bounds");
 
-        self.ptr = vptr(self.ptr.as_ptr().add(cnt));
+        self.ptr = vptr(unsafe { self.ptr.as_ptr().add(cnt) });
         self.len = self.len.checked_sub(cnt).unwrap_or(0);
         self.cap -= cnt;
     }
@@ -368,12 +358,14 @@ impl Drop for RawUsbMem {
 }
 
 #[derive(Debug, Clone, Copy)]
+/// A struct representing an allocation error from libusb.
 pub struct AllocError;
 
 pub trait DeviceHandleExt {
-    /// GOAL: Return something that can give me nonoverlapping `&mut [MaybeUninit<u8>]`s,
-    ///       just like BytesMut, but that allows mapped memory as well (Bytes doesn't
-    ///       allow conversion to BytesMut from static/mapped memory).
+    /// # Safety
+    ///
+    /// It is undefined behaviour to destroy the associated device handle
+    /// before freeing this block of memory.
     unsafe fn new_usb_mem(&self, len: usize) -> Result<UsbMemMut, AllocError>;
 }
 
@@ -386,7 +378,9 @@ impl<T: rusb::UsbContext> DeviceHandleExt for rusb::DeviceHandle<T> {
                 let raw_mem = RawUsbMem {
                     ptr,
                     len,
-                    dev_handle: NonNull::new_unchecked(dev_handle),
+                    // SAFETY: Since the ptr is non-null, that means the
+                    // allocation succeeded and we're free to use this pointer.
+                    dev_handle: unsafe { NonNull::new_unchecked(dev_handle) },
                 };
                 Ok(UsbMemMut {
                     ptr: ptr.as_non_null_ptr(),

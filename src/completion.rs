@@ -4,7 +4,7 @@ use std::{
     task::ready,
 };
 
-use pin_project::pin_project;
+use pin_project_lite::pin_project;
 use tokio::sync::{futures::Notified, Notify};
 use tokio_util::sync::{CancellationToken, WaitForCancellationFuture};
 
@@ -14,13 +14,14 @@ pub enum Event {
     Cancelled,
 }
 
-#[pin_project]
-pub struct Completion<'a> {
-    #[pin]
-    complete: Notified<'a>,
-    #[pin]
-    cancel: WaitForCancellationFuture<'a>,
-    is_cancelled: bool,
+pin_project! {
+    pub struct Completion<'a> {
+        #[pin]
+        complete: Notified<'a>,
+        #[pin]
+        cancel: WaitForCancellationFuture<'a>,
+        is_cancelled: bool,
+    }
 }
 
 impl<'a> Completion<'a> {
