@@ -909,7 +909,7 @@ unsafe fn get_ctx(transfer: &libusb_transfer) -> &UserData {
     let user_data: *const UserData = transfer.user_data.cast_const().cast();
     // SAFETY: If we're not already in freed memory, then the user data
     // should be safe to access as well.
-    unsafe { user_data.as_ref().unwrap() }
+    unsafe { user_data.as_ref().unwrap_unchecked() }
 }
 
 /// Handles a USB transfer completion, cancellation, error, or whatever,
@@ -920,7 +920,7 @@ extern "system" fn transfer_callback(transfer: *mut libusb_transfer) {
     //         created from `Arc::into_raw`, and can be turned back into
     //         a reference to the user data.
     let user_data = unsafe {
-        let transfer = transfer.as_ref().unwrap();
+        let transfer = transfer.as_ref().unwrap_unchecked();
         get_ctx(transfer)
     };
 

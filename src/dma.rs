@@ -11,7 +11,7 @@ pub struct UsbMemMut {
     ptr: NonNull<u8>,
     len: u32,
     cap: u32,
-    data: Option<Arc<RawUsbMem>>,
+    data: Arc<RawUsbMem>,
 }
 
 impl std::fmt::Debug for UsbMemMut {
@@ -22,39 +22,39 @@ impl std::fmt::Debug for UsbMemMut {
 
 impl UsbMemMut {
     #[inline]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.len as usize
     }
 
     #[inline]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.len == 0
     }
 
     #[inline]
-    pub fn capacity(&self) -> usize {
+    pub const fn capacity(&self) -> usize {
         self.cap as usize
     }
 
     #[inline]
-    fn data(&self) -> &Arc<RawUsbMem> {
-        self.data.as_ref().unwrap()
+    const fn data(&self) -> &Arc<RawUsbMem> {
+        &self.data
     }
 
     #[inline]
-    pub fn clear(&mut self) {
+    pub const fn clear(&mut self) {
         unsafe { self.set_len(0) };
     }
 
     #[inline]
-    pub fn truncate(&mut self, len: usize) {
+    pub const fn truncate(&mut self, len: usize) {
         if len <= self.len() {
             unsafe { self.set_len(len) };
         }
     }
 
     #[inline]
-    pub unsafe fn set_len(&mut self, len: usize) {
+    pub const unsafe fn set_len(&mut self, len: usize) {
         debug_assert!(len <= self.capacity(), "set_len out of bounds");
         self.len = len as u32;
     }
@@ -116,7 +116,7 @@ impl UsbMemMut {
             ptr: self.ptr,
             len: self.len,
             cap: self.cap,
-            data: Some(Arc::clone(self.data())),
+            data: Arc::clone(self.data())
         }
     }
 
@@ -398,7 +398,7 @@ impl<T: rusb::UsbContext> DeviceHandleExt for rusb::DeviceHandle<T> {
                     ptr: ptr.as_non_null_ptr(),
                     len: 0,
                     cap: len as u32,
-                    data: Some(Arc::new(raw_mem)),
+                    data: Arc::new(raw_mem),
                 })
             }
             None => Err(AllocError),

@@ -58,22 +58,22 @@ mod tb {
     }
 
     pub unsafe fn libusb_free_transfer(transfer: *mut ffi::libusb_transfer) {
-        _ = Box::from_raw(transfer)
+        _ = unsafe { Box::from_raw(transfer) }
     }
 
     pub unsafe fn libusb_cancel_transfer(transfer: *mut ffi::libusb_transfer) -> c_int {
-        let t = transfer.as_mut().unwrap();
+        let t = unsafe { transfer.as_mut().unwrap() };
         t.status = rusb::constants::LIBUSB_TRANSFER_CANCELLED;
         t.actual_length = 0;
         0
     }
 
     pub unsafe fn libusb_submit_transfer(transfer: *mut ffi::libusb_transfer) -> c_int {
-        let t = transfer.as_mut().unwrap();
+        let t = unsafe { transfer.as_mut().unwrap() };
         t.status = rusb::constants::LIBUSB_TRANSFER_COMPLETED;
         t.actual_length = t.length;
         let ptr: *const UserData = t.user_data.cast_const().cast();
-        let transfer_user_data = Arc::from_raw(ptr);
+        let transfer_user_data = unsafe { Arc::from_raw(ptr) };
         let task_user_data = Arc::clone(&transfer_user_data);
         _ = Arc::into_raw(transfer_user_data);
         tokio::spawn(async move {
