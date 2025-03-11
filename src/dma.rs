@@ -9,8 +9,8 @@ use crate::Ptr;
 
 pub struct UsbMemMut {
     ptr: NonNull<u8>,
-    len: usize,
-    cap: usize,
+    len: u32,
+    cap: u32,
     data: Option<Arc<RawUsbMem>>,
 }
 
@@ -23,34 +23,40 @@ impl std::fmt::Debug for UsbMemMut {
 impl UsbMemMut {
     #[inline]
     pub fn len(&self) -> usize {
-        self.len
+        self.len as usize
     }
 
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
+    #[inline]
     pub fn capacity(&self) -> usize {
-        self.cap
+        self.cap as usize
     }
 
+    #[inline]
     fn data(&self) -> &Arc<RawUsbMem> {
         self.data.as_ref().unwrap()
     }
 
+    #[inline]
     pub fn clear(&mut self) {
         unsafe { self.set_len(0) };
     }
 
+    #[inline]
     pub fn truncate(&mut self, len: usize) {
         if len <= self.len() {
             unsafe { self.set_len(len) };
         }
     }
 
+    #[inline]
     pub unsafe fn set_len(&mut self, len: usize) {
-        debug_assert!(len <= self.cap, "set_len out of bounds");
-        self.len = len;
+        debug_assert!(len <= self.capacity(), "set_len out of bounds");
+        self.len = len as u32;
     }
 
     #[must_use = "consider UsbMemMut::truncate if you don't need the other half"]
@@ -64,12 +70,13 @@ impl UsbMemMut {
         unsafe {
             let mut other = self.shallow_clone();
             other.advance_unchecked(at);
-            self.cap = at;
-            self.len = cmp::min(self.len, at);
+            self.cap = at as u32;
+            self.len = cmp::min(self.len, at as u32);
             other
         }
     }
 
+    #[inline]
     pub fn split(&mut self) -> Self {
         let len = self.len();
         self.split_to(len)
@@ -86,8 +93,8 @@ impl UsbMemMut {
         unsafe {
             let mut other = self.shallow_clone();
             self.advance_unchecked(to);
-            other.cap = to;
-            other.len = to;
+            other.cap = to as u32;
+            other.len = to as u32;
             other
         }
     }
@@ -97,11 +104,11 @@ impl UsbMemMut {
             return;
         }
 
-        debug_assert!(cnt <= self.cap, "internal: set_start out of bounds");
+        debug_assert!(cnt <= self.capacity(), "internal: set_start out of bounds");
 
         self.ptr = vptr(unsafe { self.ptr.as_ptr().add(cnt) });
-        self.len = self.len.checked_sub(cnt).unwrap_or(0);
-        self.cap -= cnt;
+        self.len = self.len.checked_sub(cnt as u32).unwrap_or(0);
+        self.cap -= cnt as u32;
     }
 
     unsafe fn shallow_clone(&self) -> Self {
@@ -115,12 +122,12 @@ impl UsbMemMut {
 
     #[inline]
     fn as_slice(&self) -> &[u8] {
-        unsafe { slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+        unsafe { slice::from_raw_parts(self.ptr.as_ptr(), self.len()) }
     }
 
     #[inline]
     fn as_slice_mut(&mut self) -> &mut [u8] {
-        unsafe { slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+        unsafe { slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len()) }
     }
 
     pub fn try_extend_from_slice(&mut self, extend: &[u8]) -> bool {
@@ -146,8 +153,8 @@ impl UsbMemMut {
     #[inline]
     pub fn spare_capacity_mut(&mut self) -> &mut [MaybeUninit<u8>] {
         unsafe {
-            let ptr = self.ptr.as_ptr().add(self.len);
-            let len = self.cap - self.len;
+            let ptr = self.ptr.as_ptr().add(self.len());
+            let len = self.capacity() - self.len();
 
             slice::from_raw_parts_mut(ptr.cast(), len)
         }
@@ -166,9 +173,9 @@ impl UsbMemMut {
         match Arc::strong_count(self.data()) {
             1 if self.capacity() - self.len() + off >= additional && off >= self.len() => unsafe {
                 let base_ptr = self.ptr.as_ptr().sub(off);
-                core::ptr::copy_nonoverlapping(self.ptr.as_ptr(), base_ptr, self.len);
+                core::ptr::copy_nonoverlapping(self.ptr.as_ptr(), base_ptr, self.len());
                 self.ptr = vptr(base_ptr);
-                self.cap += off;
+                self.cap += off as u32;
                 true
             },
             _ => false,
@@ -216,19 +223,19 @@ impl Buf for UsbMemMut {
 unsafe impl BufMut for UsbMemMut {
     #[inline]
     fn remaining_mut(&self) -> usize {
-        self.cap - self.len
+        self.capacity() - self.len()
     }
 
     #[inline]
     unsafe fn advance_mut(&mut self, cnt: usize) {
-        let remaining = self.cap - self.len;
+        let remaining = self.capacity() - self.len();
         if cnt > remaining {
             panic!(
                 "advance out of bounds: the len is {} but advancing by {}",
                 remaining, cnt
             );
         }
-        self.len += cnt;
+        self.len += cnt as u32;
     }
 
     #[inline]
@@ -366,11 +373,16 @@ pub trait DeviceHandleExt {
     ///
     /// It is undefined behaviour to destroy the associated device handle
     /// before freeing this block of memory.
+    ///
+    /// # Panic
+    ///
+    /// This function panics on debug-mode if `len` is larger than `u32::MAX`.
     unsafe fn new_usb_mem(&self, len: usize) -> Result<UsbMemMut, AllocError>;
 }
 
 impl<T: rusb::UsbContext> DeviceHandleExt for rusb::DeviceHandle<T> {
     unsafe fn new_usb_mem(&self, len: usize) -> Result<UsbMemMut, AllocError> {
+        debug_assert!(len < u32::MAX as usize);
         let dev_handle = self.as_raw();
         let ptr = unsafe { libusb_dev_mem_alloc(dev_handle, len) };
         match Ptr::new(ptr) {
@@ -385,7 +397,7 @@ impl<T: rusb::UsbContext> DeviceHandleExt for rusb::DeviceHandle<T> {
                 Ok(UsbMemMut {
                     ptr: ptr.as_non_null_ptr(),
                     len: 0,
-                    cap: len,
+                    cap: len as u32,
                     data: Some(Arc::new(raw_mem)),
                 })
             }
