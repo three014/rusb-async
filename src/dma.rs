@@ -107,7 +107,7 @@ impl UsbMemMut {
         debug_assert!(cnt <= self.capacity(), "internal: set_start out of bounds");
 
         self.ptr = vptr(unsafe { self.ptr.as_ptr().add(cnt) });
-        self.len = self.len.checked_sub(cnt as u32).unwrap_or(0);
+        self.len = self.len.saturating_sub(cnt as u32);
         self.cap -= cnt as u32;
     }
 

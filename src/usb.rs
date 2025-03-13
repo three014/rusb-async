@@ -19,7 +19,7 @@ mod tb {
 
     use rusb::ffi;
 
-    use crate::{dummy_callback, LibusbState, UserData};
+    use crate::{dummy_callback, UserData};
 
     pub use bytes::BytesMut as UsbMemMut;
 
@@ -78,10 +78,7 @@ mod tb {
         _ = Arc::into_raw(transfer_user_data);
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(745)).await;
-            let mut state = task_user_data.state.lock().unwrap();
-            task_user_data.completion.notify_one();
-            *state = LibusbState::Ready;
-            drop(state);
+            task_user_data.notify_ready();
         });
         0
     }

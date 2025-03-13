@@ -10,7 +10,7 @@ unsafe impl<T: Send + ?Sized> Send for Ptr<T> {}
 unsafe impl<T: Sync + ?Sized> Sync for Ptr<T> {}
 
 impl<T: ?Sized> Ptr<T> {
-    pub(crate) fn new(ptr: *mut T) -> Option<Self> {
+    pub(crate) const fn new(ptr: *mut T) -> Option<Self> {
         if let Some(pointer) = NonNull::new(ptr) {
             Some(Ptr {
                 pointer,
