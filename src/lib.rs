@@ -401,7 +401,7 @@ impl InnerTransfer {
                 len,
                 transfer_callback,
                 Arc::into_raw(Arc::clone(&user_data)).cast_mut().cast(),
-                u32::MAX,
+                1000,
             );
 
             self.as_mut().flags = flags.bits();
@@ -462,7 +462,7 @@ impl InnerTransfer {
                 num_iso_packets as i32,
                 transfer_callback,
                 Arc::into_raw(Arc::clone(&user_data)).cast_mut().cast(),
-                u32::MAX,
+                1000,
             );
         }
 
