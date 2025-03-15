@@ -31,10 +31,13 @@ use usb::{
 #[cfg(feature = "zerocopy")]
 use zerocopy_derive::*;
 
+#[cfg(all(not(test), feature = "dma"))]
 pub use dma::{AllocError, DeviceHandleExt};
+
 pub use usb::UsbMemMut;
 
 mod completion;
+#[cfg(all(not(test), feature = "dma"))]
 mod dma;
 mod ptr;
 mod state;

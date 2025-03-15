@@ -1,8 +1,11 @@
 use std::time::{Duration, Instant};
 
-use rusb::{constants::LIBUSB_REQUEST_GET_DESCRIPTOR, UsbContext};
-use rusb_async::{ControlPacket, DeviceHandleExt, InnerTransfer};
+use rusb::{UsbContext, constants::LIBUSB_REQUEST_GET_DESCRIPTOR};
+#[cfg(feature = "dma")]
+use rusb_async::DeviceHandleExt;
+use rusb_async::{ControlPacket, InnerTransfer};
 use tokio_util::sync::CancellationToken;
+#[cfg(feature = "zerocopy")]
 use zerocopy::IntoBytes;
 
 fn main() {
@@ -28,7 +31,10 @@ fn main() {
 
     let needed = size_of::<ControlPacket>() + 18;
     let now = Instant::now();
+    #[cfg(feature = "dma")]
     let mut buf = unsafe { handle.new_usb_mem(0x16000).unwrap() };
+    #[cfg(not(feature = "dma"))]
+    let mut buf = rusb_async::UsbMemMut::with_capacity(0x16000);
     let elapsed = now.elapsed();
     println!("took {elapsed:?} to map memory");
     unsafe { buf.set_len(needed) };
@@ -44,9 +50,17 @@ fn main() {
         w_index: 0,
         w_length: 18,
     };
+    #[cfg(feature = "zerocopy")]
     pkt.write_to_prefix(&mut buf[..]).unwrap();
+    #[cfg(not(feature = "zerocopy"))]
+    unsafe {
+        buf[..size_of::<ControlPacket>()]
+            .as_mut_ptr()
+            .cast::<ControlPacket>()
+            .write(pkt)
+    };
 
-    let mut transfer =
+    let transfer =
         unsafe { InnerTransfer::new(0).into_ctrl(&handle, buf, Duration::from_millis(600)) };
 
     let cancel_token = CancellationToken::new();
@@ -65,8 +79,7 @@ fn main() {
     let cancel_transfer2 = cancel_transfer.clone();
     rt.block_on(async move {
         println!("about to run transfer");
-        // SAFETY: We run this transfer to its completion.
-        let result = unsafe { transfer.submit(&cancel_transfer2) }.await;
+        let result = transfer.submit(&cancel_transfer2).await;
         println!("{result:?}");
         if result.is_ok() {
             println!("{:?}", transfer.into_buf().unwrap());

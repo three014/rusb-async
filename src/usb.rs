@@ -1,5 +1,8 @@
-#[cfg(not(test))]
+#[cfg(all(not(test), feature = "dma"))]
 pub use crate::dma::UsbMemMut;
+#[cfg(all(not(test), not(feature = "dma")))]
+pub use bytes::BytesMut as UsbMemMut;
+
 #[cfg(not(test))]
 pub use rusb::{
     ffi::{
