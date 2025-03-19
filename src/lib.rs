@@ -885,7 +885,11 @@ fn default_runtime() -> Option<Arc<dyn AsyncRuntime>> {
 
     #[cfg(feature = "runtime-compio")]
     {
-        return Some(Arc::new(CompioRuntime) as Arc<dyn AsyncRuntime>);
+        if ::compio_runtime::Runtime::try_with_current(|_| {}).is_ok() {
+            Some(Arc::new(CompioRuntime) as Arc<dyn AsyncRuntime>)
+        } else {
+            None
+        }
     }
 
     #[cfg(not(any(feature = "runtime-tokio", feature = "runtime-compio")))]
