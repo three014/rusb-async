@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use rusb::{UsbContext, constants::LIBUSB_REQUEST_GET_DESCRIPTOR};
 #[cfg(feature = "dma")]
 use rusb_async::DeviceHandleExt;
-use rusb_async::{ControlPacket, InnerTransfer};
+use rusb_async::{ControlPacket, LibusbTransfer};
 use tokio_util::sync::CancellationToken;
 #[cfg(feature = "zerocopy")]
 use zerocopy::IntoBytes;
@@ -61,7 +61,7 @@ fn main() {
     };
 
     let transfer =
-        unsafe { InnerTransfer::new(0).into_ctrl(&handle, buf, Duration::from_millis(600)) };
+        unsafe { LibusbTransfer::new(0).into_ctrl(&handle, buf, Duration::from_millis(600)) };
 
     let cancel_token = CancellationToken::new();
     let event_handler = cancel_token.clone();

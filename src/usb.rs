@@ -5,24 +5,24 @@ pub use bytes::BytesMut as UsbMemMut;
 
 #[cfg(not(test))]
 pub use rusb::{
+    DeviceHandle,
     ffi::{
         libusb_alloc_transfer, libusb_cancel_transfer, libusb_free_transfer, libusb_submit_transfer,
     },
-    DeviceHandle,
 };
 #[cfg(test)]
 pub use tb::{
-    libusb_alloc_transfer, libusb_cancel_transfer, libusb_free_transfer, libusb_submit_transfer,
-    DeviceHandle, UsbMemMut,
+    DeviceHandle, UsbMemMut, libusb_alloc_transfer, libusb_cancel_transfer, libusb_free_transfer,
+    libusb_submit_transfer,
 };
 
 #[cfg(test)]
 mod tb {
-    use std::{ffi::c_int, marker::PhantomData, sync::Arc, time::Duration};
+    use std::{ffi::c_int, marker::PhantomData, time::Duration};
 
     use rusb::ffi;
 
-    use crate::{dummy_callback, UserData};
+    use crate::Footer;
 
     pub use bytes::BytesMut as UsbMemMut;
 
@@ -41,27 +41,33 @@ mod tb {
         }
     }
 
+    const TEST_NUM_PACKETS: usize = 6 + crate::FOOTER_SIZE_IN_PACKETS;
+    const RAW_SIZE: usize = size_of::<ffi::libusb_transfer>()
+        + TEST_NUM_PACKETS * size_of::<ffi::libusb_iso_packet_descriptor>();
+
+    #[repr(C, align(8))]
+    struct Test {
+        inner: [u8; RAW_SIZE],
+    }
+
+    impl Test {
+        const fn new() -> Self {
+            Self {
+                inner: [0; RAW_SIZE],
+            }
+        }
+    }
+
     pub unsafe fn libusb_alloc_transfer(_iso_packets: c_int) -> *mut ffi::libusb_transfer {
-        assert_eq!(_iso_packets, 0, "Can't allocate dynamic slices like that for testing, sorry");
-        Box::into_raw(Box::new(ffi::libusb_transfer {
-            dev_handle: std::ptr::null_mut(),
-            flags: 0,
-            endpoint: 0,
-            transfer_type: 0,
-            timeout: 0,
-            status: 0,
-            length: 0,
-            actual_length: 0,
-            callback: dummy_callback,
-            user_data: std::ptr::null_mut(),
-            buffer: std::ptr::null_mut(),
-            num_iso_packets: 0,
-            iso_packet_desc: [],
-        }))
+        assert!(
+            TEST_NUM_PACKETS >= _iso_packets as usize,
+            "Can't allocate larger structs than this for testing, sorry"
+        );
+        Box::into_raw(Box::new(Test::new())).cast()
     }
 
     pub unsafe fn libusb_free_transfer(transfer: *mut ffi::libusb_transfer) {
-        _ = unsafe { Box::from_raw(transfer) }
+        _ = unsafe { Box::from_raw(transfer.cast::<Test>()) }
     }
 
     pub unsafe fn libusb_cancel_transfer(transfer: *mut ffi::libusb_transfer) -> c_int {
@@ -75,13 +81,11 @@ mod tb {
         let t = unsafe { transfer.as_mut().unwrap() };
         t.status = rusb::constants::LIBUSB_TRANSFER_COMPLETED;
         t.actual_length = t.length;
-        let ptr: *const UserData = t.user_data.cast_const().cast();
-        let transfer_user_data = unsafe { Arc::from_raw(ptr) };
-        let task_user_data = Arc::clone(&transfer_user_data);
-        _ = Arc::into_raw(transfer_user_data);
+        let footer = Footer::ref_from_transfer(t);
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(745)).await;
-            task_user_data.notify_ready();
+            footer.state().set_ready();
+            footer.waker().wake();
         });
         0
     }

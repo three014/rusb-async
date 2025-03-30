@@ -84,6 +84,7 @@ impl State {
         is_helping(val) && is_helping(self.inner.swap(FINISHED, Ordering::AcqRel))
     }
 
+    #[inline]
     pub fn get(&self) -> StateRepr {
         let state = self.inner.load(Ordering::Acquire);
 
@@ -111,6 +112,12 @@ impl State {
             IDLE => StateRepr::Idle,
             bad => invalid_value(bad),
         }
+    }
+}
+
+impl Default for State {
+    fn default() -> Self {
+        State::new_idle()
     }
 }
 
