@@ -501,7 +501,13 @@ impl LibusbTransfer2 {
         }
     }
 
-    fn submit(&mut self) -> rusb::Result<()> {
+    /// Submits the transfer to libusb.
+    ///
+    /// Since the inner call to `libusb_submit_transfer` is thread-safe,
+    /// this function can be called from any thread. However, trying
+    /// to submit the same transfer twice before the first submission
+    /// finishes will return a (harmless) error.
+    fn submit(&self) -> rusb::Result<()> {
         let result = unsafe { libusb_submit_transfer(self.inner.as_ptr()) };
         if result != 0 {
             Err(from_libusb(result))
@@ -815,12 +821,21 @@ impl Transfer2 {
     }
 
     #[inline]
-    pub fn submit<'a>(&'a mut self, cancel_token: &'a CancellationToken) -> TransferFuture2<'a> {
+    pub fn submit_and_wait<'a>(&'a mut self, cancel_token: &'a CancellationToken) -> TransferFuture2<'a> {
         TransferFuture2 {
             cancel: cancel_token.cancelled(),
             transfer: self.inner.as_mut().unwrap(),
             is_cancelled: false,
         }
+    }
+
+    #[inline]
+    pub fn try_submit(&self) -> rusb::Result<()> {
+        let transfer = self.inner.as_ref().unwrap();
+        let state = transfer.footer().state();
+        transfer.submit()?;
+        state.set_running();
+        Ok(())
     }
 
     #[inline]
@@ -1664,7 +1679,7 @@ mod tests {
         let cancel = CancellationToken::new();
 
         let result = tokio::select! {
-            result = transfer.submit(&cancel) => {
+            result = transfer.submit_and_wait(&cancel) => {
                 result
             },
             _ = tokio::time::sleep(Duration::from_secs(3)) => {
@@ -1684,7 +1699,7 @@ mod tests {
         let mut transfer = unsafe { inner_transfer.into_int(&handle, 0, buf) };
         let cancel = CancellationToken::new();
 
-        let mut fut = pin!(transfer.submit(&cancel));
+        let mut fut = pin!(transfer.submit_and_wait(&cancel));
 
         let result: Option<_> = tokio::select! {
             result = &mut fut => {
