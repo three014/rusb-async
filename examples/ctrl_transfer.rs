@@ -3,8 +3,7 @@ use std::time::{Duration, Instant};
 use rusb::{UsbContext, constants::LIBUSB_REQUEST_GET_DESCRIPTOR};
 #[cfg(feature = "dma")]
 use rusb_async::DeviceHandleExt;
-use rusb_async::{ControlPacket, LibusbTransfer};
-use tokio_util::sync::CancellationToken;
+use rusb_async::{CancellationToken, ControlPacket, LibusbTransfer2};
 #[cfg(feature = "zerocopy")]
 use zerocopy::IntoBytes;
 
@@ -60,8 +59,8 @@ fn main() {
             .write(pkt)
     };
 
-    let transfer =
-        unsafe { LibusbTransfer::new(0).into_ctrl(&handle, buf, Duration::from_millis(600)) };
+    let mut transfer =
+        unsafe { LibusbTransfer2::new_with_zero_packets().into_ctrl(&handle, buf, Duration::from_millis(600)) };
 
     let cancel_token = CancellationToken::new();
     let event_handler = cancel_token.clone();
@@ -76,13 +75,13 @@ fn main() {
     let rt = tokio::runtime::Runtime::new().unwrap();
 
     let cancel_transfer = CancellationToken::new();
-    let cancel_transfer2 = cancel_transfer.clone();
+    let mut cancel_transfer2 = cancel_transfer.clone();
     rt.block_on(async move {
         println!("about to run transfer");
-        let result = transfer.submit(&cancel_transfer2).await;
+        let result = transfer.submit_and_wait(&mut cancel_transfer2).await;
         println!("{result:?}");
         if result.is_ok() {
-            println!("{:?}", transfer.into_buf().unwrap());
+            println!("{:?}", transfer.into_parts().unwrap().1);
         }
     });
 

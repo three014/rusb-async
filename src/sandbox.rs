@@ -1,15 +1,11 @@
 use std::{
     marker::PhantomData,
-    os::fd::{BorrowedFd, OwnedFd},
     ptr::NonNull,
 };
 
 use compio_driver::{OpCode, OpEntry, Proactor};
-use io_uring::{Submitter, opcode::PollAdd, types::Fd};
-use rusb::{
-    Context, UsbContext,
-    ffi::{self, libusb_pollfd},
-};
+use io_uring::{opcode::PollAdd, types::Fd};
+use rusb::ffi::{self, libusb_pollfd};
 
 #[doc(hidden)]
 macro_rules! try_unsafe {
@@ -154,5 +150,12 @@ fn foo() {
         // futures. Polling externally prevents us from having to wake up
         // potentially N futures for every transfer that completes, aka
         // O(N^2) operation.
+        //
+        // 4/1/25: Silly idea
+        //
+        // What if I made each transfer fight to be the one the async
+        // executor wakes up when a poll returns an event??
+        //
+        // A call to poll checks its state and does one of these things:
     }
 }

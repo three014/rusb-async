@@ -1,6 +1,6 @@
 [package]
 name = "rusb_async"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2024"
 
 [dependencies]
@@ -8,12 +8,12 @@ atomic-waker = "1.1.2"
 bitflags = "2.8.0"
 bytes = "1.9.0"
 compio-runtime = { version = "0.7.0", optional = true }
+tokio = { version = "1.43.0", default-features = false, optional = true }
 pin-project-lite = "0.2.16"
 rusb = { git = "https://github.com/three014/rusb.git", version = "0.9.4" }
-tokio = { version = "1.43.0", default-features = false, features = ["sync", "macros"] }
-tokio-util = { version = "0.7.13", default-features = false }
 zerocopy = { version = "0.8.14", optional = true }
 zerocopy-derive = { version = "0.8.14", optional = true }
+flag = { version = "0.1.1", git = "https://github.com/three014/flag.git" }
 
 [features]
 default = ["runtime-compio"]
@@ -23,7 +23,7 @@ runtime-tokio = ["tokio/rt"]
 runtime-compio = ["compio-runtime/io-uring"]
 
 [dev-dependencies]
-tokio = { version = "1.43.0", default-features = false, features = ["rt", "rt-multi-thread", "time"] }
+tokio = { version = "1.43.0", default-features = false, features = ["macros", "rt", "rt-multi-thread", "time"] }
 compio-driver = "0.7.0"
 io-uring = "0.7.4"
 libc = "0.2.171"
