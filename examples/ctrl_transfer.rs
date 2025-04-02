@@ -59,7 +59,7 @@ fn main() {
             .write(pkt)
     };
 
-    let mut transfer =
+    let transfer =
         unsafe { LibusbTransfer2::new_with_zero_packets().into_ctrl(&handle, buf, Duration::from_millis(600)) };
 
     let cancel_token = CancellationToken::new();
@@ -81,7 +81,7 @@ fn main() {
         let result = transfer.submit_and_wait(&mut cancel_transfer2).await;
         println!("{result:?}");
         if result.is_ok() {
-            println!("{:?}", transfer.into_parts().unwrap().1);
+            println!("{:?}", transfer.complete().unwrap().1);
         }
     });
 

@@ -38,8 +38,8 @@ mod ptr;
 mod state;
 mod usb;
 mod cancel {
-    use std::pin::pin;
     use flag::Flag;
+    use std::pin::pin;
 
     #[derive(Clone)]
     pub struct CancellationToken(Flag);
@@ -212,14 +212,32 @@ impl Footer {
     }
 
     #[inline]
-    const fn take_buf(&mut self) -> Option<UsbMemMut> {
+    const unsafe fn take_buf(&mut self) -> Option<UsbMemMut> {
         self.buf.take()
     }
 
+    /// Takes ownership of a [`BytesMut`] and returns a pointer
+    /// and length suitable for a USB transfer.
+    ///
+    /// If a buffer was previously stored inside this footer
+    /// and not removed before calling this function, then that
+    /// buffer will be dropped, regardless if a transfer was
+    /// using that buffer.
+    ///
+    /// # Safety
+    ///
+    /// For the above reasons, calling this function during
+    /// an active transfer is UB and will probably cause a
+    /// use-after-free bug to occur.
     #[inline]
-    fn insert_buf(&mut self, mut buf: UsbMemMut) -> (*mut u8, usize) {
+    unsafe fn insert_buf(&mut self, mut buf: UsbMemMut) -> (*mut u8, usize) {
         let len = buf.len();
+
+        // Clearing the buffer sets the length to 0,
+        // which prevents this data from being read by
+        // anyone other than the user of the raw pointer.
         buf.clear();
+
         let ptr = buf.as_mut_ptr();
         self.buf = Some(buf);
         (ptr, len)
@@ -240,9 +258,6 @@ impl Footer {
 /// while a transfer is active. Fields that cannot be accessed during
 /// an active transfer can rely on the `state` field of the [`Footer`]
 /// to tell when it's okay to access the inner data.
-///
-/// To make this work, all pointers to transfer itself must be
-/// `*const` pointers to satisfy the aliasing rule, while individual
 pub struct LibusbTransfer2 {
     inner: Ptr<libusb_transfer>,
 }
@@ -517,10 +532,10 @@ impl LibusbTransfer2 {
         buf: UsbMemMut,
     ) -> Transfer2 {
         // SAFETY: Caller upholds the "not in active submission" rule.
-        unsafe { self.reset() };
-        let (ptr, len) = self.footer_mut().insert_buf(buf);
-
         unsafe {
+            self.reset();
+            let (ptr, len) = self.footer_mut().insert_buf(buf);
+
             let transfer = self.inner.as_mut();
             transfer.dev_handle = dev_handle.as_raw();
             transfer.endpoint = endpoint;
@@ -552,10 +567,10 @@ impl LibusbTransfer2 {
         buf: UsbMemMut,
     ) -> Transfer2 {
         // SAFETY: Caller upholds the "not in active submission" rule.
-        unsafe { self.reset() };
-        let (ptr, len) = self.footer_mut().insert_buf(buf);
-
         unsafe {
+            self.reset();
+            let (ptr, len) = self.footer_mut().insert_buf(buf);
+
             let transfer = self.inner.as_mut();
             transfer.dev_handle = dev_handle.as_raw();
             transfer.endpoint = endpoint;
@@ -596,11 +611,11 @@ impl LibusbTransfer2 {
         timeout: Duration,
     ) -> Transfer2 {
         // SAFETY: Caller upholds the "not in active submission" rule.
-        unsafe { self.reset() };
-        let (ptr, len) = self.footer_mut().insert_buf(buf);
-        let timeout = timeout.clamp(Duration::ZERO, Duration::from_millis(u32::MAX as u64));
-
         unsafe {
+            self.reset();
+            let (ptr, len) = self.footer_mut().insert_buf(buf);
+            let timeout = timeout.clamp(Duration::ZERO, Duration::from_millis(u32::MAX as u64));
+
             let transfer = self.inner.as_mut();
             transfer.dev_handle = dev_handle.as_raw();
             transfer.endpoint = 0;
@@ -634,16 +649,16 @@ impl LibusbTransfer2 {
         let num_iso_packets = iso_packets.len();
         assert!(num_iso_packets <= self.max_iso_packets() as usize);
 
-        unsafe { self.reset() };
-        let (ptr, len) = self.footer_mut().insert_buf(buf);
-
-        iso_packets
-            .map(|pkt| pkt.len())
-            // SAFETY: We're not in an active transfer yet.
-            .zip(unsafe { self.iso_packets_mut() })
-            .for_each(|(len, pkt)| pkt.length = len);
-
+        // SAFETY: Caller upholds safety contract.
         unsafe {
+            self.reset();
+            let (ptr, len) = self.footer_mut().insert_buf(buf);
+
+            iso_packets
+                .map(|pkt| pkt.len())
+                .zip(self.iso_packets_mut())
+                .for_each(|(len, pkt)| pkt.length = len);
+
             let transfer = self.inner.as_mut();
             transfer.dev_handle = dev_handle.as_raw();
             transfer.endpoint = endpoint;
@@ -679,12 +694,12 @@ impl LibusbTransfer2 {
 
     #[inline]
     const fn is_ctrl(&self) -> bool {
-        // SAFETY: This field is written to once, then never changed afterwards.
         matches!(self.kind(), rusb::TransferType::Control)
     }
 
     #[inline]
     const fn kind(&self) -> rusb::TransferType {
+        // SAFETY: This field is written to once, then never changed afterwards.
         match unsafe { self.inner.as_ref().transfer_type } {
             LIBUSB_TRANSFER_TYPE_CONTROL => rusb::TransferType::Control,
             LIBUSB_TRANSFER_TYPE_INTERRUPT => rusb::TransferType::Interrupt,
@@ -713,18 +728,13 @@ impl Drop for LibusbTransfer2 {
     }
 }
 
-unsafe fn handle_ready(transfer: &mut LibusbTransfer2) -> TransferStatus {
+unsafe fn completed_buf_len(transfer: &LibusbTransfer2) -> usize {
     unsafe {
-        let transfer_len = if transfer.is_ctrl() {
+        if transfer.is_ctrl() {
             transfer.len() + size_of::<ControlPacket>()
         } else {
             transfer.len()
-        };
-        let status = transfer.status();
-
-        transfer.footer_mut().set_buf_len(transfer_len);
-
-        status
+        }
     }
 }
 
@@ -732,40 +742,40 @@ pin_project! {
     pub struct Wait<'a> {
         #[pin]
         cancel: &'a mut CancellationToken,
-        transfer: &'a mut LibusbTransfer2,
+        transfer: &'a LibusbTransfer2,
         is_cancelled: bool,
     }
 }
 
 impl Future for Wait<'_> {
-    type Output = rusb::Result<TransferStatus>;
+    type Output = TransferStatus;
 
     fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
-        let mut this = self.project();
+        let this = self.project();
         let transfer = this.transfer;
 
-        #[inline(never)]
-        #[cold]
-        fn err_idle() -> ! {
-            panic!("polled during idle transfer state")
-        }
-
         match transfer.footer().state().get() {
-            StateRepr::Idle => err_idle(),
-            StateRepr::Running if !*this.is_cancelled => {
+            StateRepr::Idle => {
                 transfer.footer().waker().register(cx.waker());
-                ready!(this.cancel.as_mut().poll(cx));
-                *this.is_cancelled = true;
-                transfer.cancel()?;
+                if !transfer.footer().state().set_running() {
+                    // SAFETY: Transfer has completed, we are back
+                    // to being the only place that can read/write
+                    // to this data.
+                    return Poll::Ready(unsafe { transfer.status() });
+                }
+                ready!(this.cancel.poll(cx));
+                _ = transfer.cancel();
             }
             StateRepr::Running => {
-                transfer.footer().waker().register(cx.waker());
+                transfer.footer().waker.register(cx.waker());
+                ready!(this.cancel.poll(cx));
+                _ = transfer.cancel();
             }
             // SAFETY: Transfer has completed, we are back
             // to being the only place that can read/write
             // to this data.
             StateRepr::Ready => unsafe {
-                return Poll::Ready(Ok(handle_ready(transfer)));
+                return Poll::Ready(transfer.status());
             },
         }
         Poll::Pending
@@ -776,7 +786,7 @@ pin_project! {
     pub struct SubmitAndWait<'a> {
         #[pin]
         cancel: &'a mut CancellationToken,
-        transfer: &'a mut LibusbTransfer2,
+        transfer: &'a LibusbTransfer2,
         is_cancelled: bool,
     }
 }
@@ -785,7 +795,7 @@ impl Future for SubmitAndWait<'_> {
     type Output = rusb::Result<TransferStatus>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
-        let mut this = self.project();
+        let this = self.project();
         let transfer = this.transfer;
 
         match transfer.footer().state().get() {
@@ -793,23 +803,24 @@ impl Future for SubmitAndWait<'_> {
                 transfer.footer().waker().register(cx.waker());
                 transfer.submit()?;
                 if !transfer.footer().state().set_running() {
-                    return Poll::Ready(Ok(unsafe { handle_ready(transfer) }));
+                    // SAFETY: Transfer has completed, we are back
+                    // to being the only place that can read/write
+                    // to this data.
+                    return Poll::Ready(Ok(unsafe { transfer.status() }));
                 }
-            }
-            StateRepr::Running if !*this.is_cancelled => {
-                transfer.footer().waker().register(cx.waker());
-                ready!(this.cancel.as_mut().poll(cx));
-                *this.is_cancelled = true;
-                transfer.cancel()?;
+                ready!(this.cancel.poll(cx));
+                _ = transfer.cancel();
             }
             StateRepr::Running => {
-                transfer.footer().waker().register(cx.waker());
+                transfer.footer().waker.register(cx.waker());
+                ready!(this.cancel.poll(cx));
+                _ = transfer.cancel();
             }
             // SAFETY: Transfer has completed, we are back
             // to being the only place that can read/write
             // to this data.
             StateRepr::Ready => unsafe {
-                return Poll::Ready(Ok(handle_ready(transfer)));
+                return Poll::Ready(Ok(transfer.status()));
             },
         }
         Poll::Pending
@@ -819,6 +830,8 @@ impl Future for SubmitAndWait<'_> {
 pub struct Transfer2 {
     inner: Option<LibusbTransfer2>,
 }
+
+unsafe impl Sync for Transfer2 {}
 
 impl Transfer2 {
     #[inline]
@@ -835,21 +848,21 @@ impl Transfer2 {
 
     #[inline]
     pub fn submit_and_wait<'a>(
-        &'a mut self,
+        &'a self,
         cancel_token: &'a mut CancellationToken,
     ) -> SubmitAndWait<'a> {
         SubmitAndWait {
             cancel: cancel_token,
-            transfer: self.inner.as_mut().unwrap(),
+            transfer: self.inner.as_ref().unwrap(),
             is_cancelled: false,
         }
     }
 
     #[inline]
-    pub fn wait<'a>(&'a mut self, cancel_token: &'a mut CancellationToken) -> Wait<'a> {
+    pub fn wait<'a>(&'a self, cancel_token: &'a mut CancellationToken) -> Wait<'a> {
         Wait {
             cancel: cancel_token,
-            transfer: self.inner.as_mut().unwrap(),
+            transfer: self.inner.as_ref().unwrap(),
             is_cancelled: false,
         }
     }
@@ -881,12 +894,19 @@ impl Transfer2 {
         self.inner.as_ref().unwrap().cancel()
     }
 
-    #[inline]
-    pub fn into_parts(mut self) -> Option<(LibusbTransfer2, UsbMemMut)> {
+    pub fn complete(mut self) -> Option<(LibusbTransfer2, UsbMemMut)> {
         (!self.is_running()).then(|| {
             let mut transfer = self.inner.take().unwrap();
-            let buf = transfer.footer_mut().take_buf().unwrap();
-            (transfer, buf)
+
+            // SAFETY: The `self.is_running()` call ensures we're
+            // not in an active transfer.
+            unsafe {
+                let transfer_len = completed_buf_len(&transfer);
+                let mut buf = transfer.footer_mut().take_buf().unwrap();
+                buf.set_len(transfer_len);
+
+                (transfer, buf)
+            }
         })
     }
 }
@@ -996,7 +1016,7 @@ mod tests {
         let buf = UsbMemMut::with_capacity(64);
         let inner_transfer = LibusbTransfer2::new_with_zero_packets();
 
-        let mut transfer = unsafe { inner_transfer.into_int(&handle, 0, buf) };
+        let transfer = unsafe { inner_transfer.into_int(&handle, 0, buf) };
         let mut cancel = CancellationToken::new();
 
         let result = tokio::select! {
@@ -1017,7 +1037,7 @@ mod tests {
         let buf = UsbMemMut::with_capacity(64);
         let inner_transfer = LibusbTransfer2::new(3);
 
-        let mut transfer = unsafe { inner_transfer.into_int(&handle, 0, buf) };
+        let transfer = unsafe { inner_transfer.into_int(&handle, 0, buf) };
         let mut cancel = CancellationToken::new();
 
         let result: Option<_> = tokio::select! {
@@ -1034,7 +1054,7 @@ mod tests {
             None => {
                 cancel.cancel();
                 let result = transfer.wait(&mut cancel).await;
-                assert_eq!(result, Ok(TransferStatus::Cancelled));
+                assert_eq!(result, TransferStatus::Cancelled);
             }
         }
     }
