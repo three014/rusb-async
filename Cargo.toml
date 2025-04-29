@@ -24,6 +24,15 @@ runtime-compio = ["compio-runtime/io-uring"]
 
 [dev-dependencies]
 tokio = { version = "1.43.0", default-features = false, features = ["macros", "rt", "rt-multi-thread", "time"] }
+compio-buf = "0.5.1"
 compio-driver = "0.7.0"
+futures-util = { version = "0.3.31", default-features = false }
 io-uring = "0.7.4"
 libc = "0.2.171"
+nohash-hasher = "0.2.0"
+cooked-waker = "5.0.0"
+
+[patch.crates-io]
+compio-runtime = { git = "https://github.com/three014/compio.git" }
+compio-buf = { git = "https://github.com/three014/compio.git" }
+compio-driver = { git = "https://github.com/three014/compio.git" }

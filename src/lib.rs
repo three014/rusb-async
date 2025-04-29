@@ -17,6 +17,7 @@ use std::future::Future;
 use std::mem::{ManuallyDrop, MaybeUninit};
 use std::pin::Pin;
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{Poll, ready};
 use std::time::Duration;
@@ -167,6 +168,7 @@ struct Footer {
     waker: AtomicWaker,
     state: State,
     num_iso_packets: u16,
+    is_cancelled: AtomicBool,
     buf: Option<UsbMemMut>,
 }
 
@@ -177,6 +179,7 @@ impl Footer {
             waker: AtomicWaker::new(),
             state: State::new_idle(),
             num_iso_packets,
+            is_cancelled: AtomicBool::new(false),
             buf: None,
         }
     }
@@ -243,6 +246,14 @@ impl Footer {
         (ptr, len)
     }
 
+    fn mark_cancelled(&self) {
+        self.is_cancelled.store(true, Ordering::Relaxed);
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.is_cancelled.load(Ordering::Relaxed)
+    }
+
     #[inline]
     unsafe fn set_buf_len(&mut self, transfer_len: usize) {
         if let Some(buf) = self.buf.as_mut() {
@@ -256,7 +267,7 @@ impl Footer {
 /// The main idea here is: There are certain fields that can be accessed
 /// while a transfer is active, and some fields that cannot be accessed
 /// while a transfer is active. Fields that cannot be accessed during
-/// an active transfer can rely on the `state` field of the [`Footer`]
+/// an active transfer can rely on the `state` field of the `Footer`
 /// to tell when it's okay to access the inner data.
 pub struct LibusbTransfer2 {
     inner: Ptr<libusb_transfer>,
@@ -482,21 +493,11 @@ impl LibusbTransfer2 {
     /// to submit the same transfer twice before the first submission
     /// finishes will return a (harmless) error.
     fn submit(&self) -> rusb::Result<()> {
-        let result = unsafe { libusb_submit_transfer(self.inner.as_ptr()) };
-        if result != 0 {
-            Err(from_libusb(result))
-        } else {
-            Ok(())
-        }
+        unsafe { c_try(libusb_submit_transfer(self.inner.as_ptr())) }
     }
 
     fn cancel(&self) -> rusb::Result<()> {
-        let result = unsafe { libusb_cancel_transfer(self.inner.as_ptr()) };
-        if result != 0 {
-            Err(from_libusb(result))
-        } else {
-            Ok(())
-        }
+        unsafe { c_try(libusb_cancel_transfer(self.inner.as_ptr())) }
     }
 
     /// Resets the transfer state and clears out old data.
@@ -515,7 +516,7 @@ impl LibusbTransfer2 {
     }
 
     /// Populates the fields of `self` with the supplied data and returns
-    /// a new [`Transfer`] ready to submit.
+    /// a new [`Transfer2`] ready to submit.
     ///
     /// To use this function correctly, `buf.len()` must be the length
     /// of the data the caller expects to receive or send. The remaining
@@ -549,7 +550,7 @@ impl LibusbTransfer2 {
     }
 
     /// Populates the fields of `self` with the supplied data and returns
-    /// a new [`Transfer`] ready to submit.
+    /// a new [`Transfer2`] ready to submit.
     ///
     /// To use this function correctly, `buf.len()` must be the length
     /// of the data the caller expects to receive or send. The remaining
@@ -585,7 +586,7 @@ impl LibusbTransfer2 {
     }
 
     /// Populates the fields of `self` with the supplied data and returns
-    /// a new [`Transfer`] ready to submit.
+    /// a new [`Transfer2`] ready to submit.
     ///
     /// To use this function correctly, `buf.len()` must be the length
     /// of the data the caller expects to receive or send. The remaining
@@ -629,7 +630,7 @@ impl LibusbTransfer2 {
     }
 
     /// Populates the fields of `self` with the supplied data and returns
-    /// a new [`Transfer`] ready to submit.
+    /// a new [`Transfer2`] ready to submit.
     ///
     /// To use this function correctly, `buf.len()` must be the length
     /// of the data the caller expects to receive or send. The remaining
@@ -986,21 +987,22 @@ extern "system" fn transfer_callback2(transfer: *mut libusb_transfer) {
     footer.waker().wake();
 }
 
-pub(crate) fn from_libusb(err: i32) -> rusb::Error {
-    match err {
-        LIBUSB_ERROR_IO => rusb::Error::Io,
-        LIBUSB_ERROR_INVALID_PARAM => rusb::Error::InvalidParam,
-        LIBUSB_ERROR_ACCESS => rusb::Error::Access,
-        LIBUSB_ERROR_NO_DEVICE => rusb::Error::NoDevice,
-        LIBUSB_ERROR_NOT_FOUND => rusb::Error::NotFound,
-        LIBUSB_ERROR_BUSY => rusb::Error::Busy,
-        LIBUSB_ERROR_TIMEOUT => rusb::Error::Timeout,
-        LIBUSB_ERROR_OVERFLOW => rusb::Error::Overflow,
-        LIBUSB_ERROR_PIPE => rusb::Error::Pipe,
-        LIBUSB_ERROR_INTERRUPTED => rusb::Error::Interrupted,
-        LIBUSB_ERROR_NO_MEM => rusb::Error::NoMem,
-        LIBUSB_ERROR_NOT_SUPPORTED => rusb::Error::NotSupported,
-        _ => rusb::Error::Other,
+pub(crate) fn c_try(code: i32) -> rusb::Result<()> {
+    match code {
+        0 => Ok(()),
+        LIBUSB_ERROR_IO => Err(rusb::Error::Io),
+        LIBUSB_ERROR_INVALID_PARAM => Err(rusb::Error::InvalidParam),
+        LIBUSB_ERROR_ACCESS => Err(rusb::Error::Access),
+        LIBUSB_ERROR_NO_DEVICE => Err(rusb::Error::NoDevice),
+        LIBUSB_ERROR_NOT_FOUND => Err(rusb::Error::NotFound),
+        LIBUSB_ERROR_BUSY => Err(rusb::Error::Busy),
+        LIBUSB_ERROR_TIMEOUT => Err(rusb::Error::Timeout),
+        LIBUSB_ERROR_OVERFLOW => Err(rusb::Error::Overflow),
+        LIBUSB_ERROR_PIPE => Err(rusb::Error::Pipe),
+        LIBUSB_ERROR_INTERRUPTED => Err(rusb::Error::Interrupted),
+        LIBUSB_ERROR_NO_MEM => Err(rusb::Error::NoMem),
+        LIBUSB_ERROR_NOT_SUPPORTED => Err(rusb::Error::NotSupported),
+        _ => Err(rusb::Error::Other),
     }
 }
 
