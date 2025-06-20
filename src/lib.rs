@@ -70,11 +70,10 @@ mod cancel {
         }
     }
 }
-
-pub use cancel::CancellationToken;
-
-#[cfg(test)]
 mod sandbox;
+
+pub use sandbox::{Runtime, Transfer3, Wait3};
+pub use cancel::CancellationToken;
 
 #[cfg_attr(
     feature = "zerocopy",
