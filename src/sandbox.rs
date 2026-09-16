@@ -211,6 +211,8 @@ impl OpCode for LibusbPoll {
     }
 }
 
+/// Helper struct for holding key-value pairs.
+/// Might as well have been a tuple.
 struct Entry<K, V> {
     key: K,
     value: V,
@@ -222,11 +224,15 @@ struct ActiveTransfers {
 }
 
 impl ActiveTransfers {
+    /// Creates a new entry that links the id with the
+    /// provided waker, or just updates the current waker
+    /// if the association already exists.
+    ///
+    /// If the previous waker's flag was already set,
+    /// the new waker will be called.
     fn push_or_update(&self, id: usize, waker: &Waker) {
-        if let Some((atomic, needs_to_handle_event)) = self
-            .inner
-            .read()
-            .unwrap()
+        let wakers = self.inner.read().unwrap();
+        if let Some((atomic, needs_to_handle_event)) = wakers
             .iter()
             .find(|entry| id == entry.key)
             .map(|entry| &entry.value)
@@ -253,8 +259,8 @@ impl ActiveTransfers {
             .read()
             .unwrap()
             .iter()
-            .map(|entry| &entry.value)
-            .for_each(|(_, needs_to_handle_event)| {
+            .map(|entry| &entry.value.1)
+            .for_each(|needs_to_handle_event| {
                 needs_to_handle_event.store(false, Ordering::Relaxed)
             });
     }
@@ -266,20 +272,19 @@ impl ActiveTransfers {
     /// the next available waker.
     fn remove(&self, id: usize) {
         let mut wakers = self.inner.write().unwrap();
-        if let Some((_, needs_to_handle_event)) = wakers
-            .iter()
-            .position(|entry| id == entry.key)
-            .map(|idx| wakers.swap_remove(idx).value)
-        {
-            if needs_to_handle_event.load(Ordering::Relaxed) {
-                if let Some((next_waker, needs_to_handle_event)) =
-                    self.inner.read().unwrap().first().map(|entry| &entry.value)
-                {
-                    needs_to_handle_event.store(true, Ordering::Relaxed);
-                    next_waker.wake();
-                } else {
-                    // TODO: What to do when no one else can check on libusb??
-                }
+        let need_to_handle_event = wakers
+            .extract_if(.., |entry| id == entry.key)
+            .next()
+            .map(|entry| entry.value.1)
+            .is_some_and(|needs_to_handle_event| needs_to_handle_event.load(Ordering::Relaxed));
+        if need_to_handle_event {
+            if let Some((next_waker, needs_to_handle_event)) =
+                self.inner.read().unwrap().first().map(|entry| &entry.value)
+            {
+                needs_to_handle_event.store(true, Ordering::Relaxed);
+                next_waker.wake();
+            } else {
+                // TODO: What to do when no one else can check on libusb?
             }
         }
     }
@@ -336,24 +341,19 @@ impl AllEntries {
         (&mut self.active_and_ready, &mut self.retired)
     }
 
+    /// Run after polling the active entries
     fn update(&mut self) {
         let (active_and_ready, retired) = self.split_borrow_mut();
         let (active, ready) = active_and_ready.split_borrow_mut();
 
-        let ready = ready
-            .drain(..)
-            .filter_map(|(_, result)| match result {
-                Ok(poll) => {
-                    if let Some(idx) = retired.iter().position(|&fd| poll.fd == fd) {
-                        retired.swap_remove(idx);
-                        None
-                    } else {
-                        Some(poll)
-                    }
-                }
-                Err(err) => unimplemented!("{err}"),
-            })
-            .map(submit_entry);
+        ready.retain(|(_, result)| match result {
+            Ok(poll) => 0 == retired.extract_if(.., |&mut fd| poll.fd == fd).count(),
+            Err(_) => true,
+        });
+        let ready = ready.drain(..).map(|(_, result)| match result {
+            Ok(poll) => submit_entry(poll),
+            Err(err) => unimplemented!("{err}"),
+        });
 
         active.extend(ready);
     }
@@ -502,12 +502,18 @@ impl Future for Entries {
         let start_idx = ready.len();
         ready.extend(completed);
 
+        // Start with the index of the next set of completed entries.
         if let Some(ready) = ready.get(start_idx..) {
+            // Remove the entries from the active list
+            // for each completed entry so that they don't
+            // get polled before being handled again.
             for &(idx, _) in ready.iter().rev() {
                 active.swap_remove(idx);
             }
         }
 
+        // We return ready when at least one future is
+        // ready to be handled.
         if ready.is_empty() {
             Poll::Pending
         } else {
@@ -595,15 +601,14 @@ impl Future for Wait3<'_> {
                     this.cx
                         .libusb
                         .handle_events()
-                        .expect("we should be the only one handling events, and we should only handle events when we get stuff from poll");
+                        .expect("libusb reported an error in handling events");
                     this.cx.active_transfers.handled_events();
 
                     // After calling into libusb, we can check which file descriptors
                     // gave us events. If any descriptors were placed into the
                     // `retired` list, then we should not submit those descriptors
                     // again. Otherwise, it's probably okay to submit them again.
-                    let mut entries = this.cx.entries.lock().unwrap();
-                    entries.update();
+                    this.cx.entries.lock().unwrap().update();
                 }
                 // SAFETY: Transfer has completed, we are back
                 // to being the only place that can read/write
